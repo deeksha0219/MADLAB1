@@ -18,7 +18,7 @@ import MMLibraryScreen from "../screens/MMLibraryScreen";
 import MMAdminCategoryScreen from "../screens/MMAdminCategoryScreen";
 import MMLibraryCategoryScreen from "../screens/MMLibraryCategoryScreen";
 
-export const SERVER_IP = "http://10.133.46.28:5000";
+
 
 const Stack = createNativeStackNavigator();
 

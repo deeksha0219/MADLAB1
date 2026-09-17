@@ -10,47 +10,79 @@ import firestore from "@react-native-firebase/firestore";
 export default function MMLibraryCategoryScreen({ route, navigation }: any) {
   const { category } = route.params;
   const [unavailableItems, setUnavailableItems] = useState<string[]>([]);
+  const [quantities, setQuantities] = useState<{ [key: string]: number }>({}); // ✅ NEW
 
-  // 🔥 Listen to unavailable items from Firestore
   useEffect(() => {
-  const unsubscribe = firestore()
-    .collection("menu")
-    .where("canteen", "==", "MM_LIBRARY") // ✅ only this canteen
-    .onSnapshot(snap => {
-      const unavailable: string[] = [];
-      snap.docs.forEach(doc => {
-        const data = doc.data();
-        if (data.available === false) unavailable.push(data.name);
+    const unsubscribe = firestore()
+      .collection("menu")
+      .where("canteen", "==", "MM_LIBRARY")
+      .onSnapshot(snap => {
+        const unavailable: string[] = [];
+        snap.docs.forEach(doc => {
+          const data = doc.data();
+          if (data.available === false) unavailable.push(data.name);
+        });
+        setUnavailableItems(unavailable);
       });
-      setUnavailableItems(unavailable);
-    });
-  return () => unsubscribe();
-}, [])
+    return () => unsubscribe();
+  }, []);
 
-  const addToCart = async (item: any) => {
-  try {
-    const cartRef = firestore().collection("cart");
-    const existing = await cartRef.where("name", "==", item.name).get();
+  // ✅ NEW — sync cart quantities live
+  useEffect(() => {
+    const unsubscribe = firestore()
+      .collection("cart")
+      .onSnapshot(snap => {
+        const qtys: { [key: string]: number } = {};
+        snap.docs.forEach(doc => {
+          const data = doc.data();
+          qtys[data.name] = data.quantity;
+        });
+        setQuantities(qtys);
+      });
+    return () => unsubscribe();
+  }, []);
 
-    if (!existing.empty) {
-      const doc = existing.docs[0];
-      await cartRef.doc(doc.id).update({
-        quantity: doc.data().quantity + 1,
-      });
-    } else {
-      await cartRef.add({
-        name: item.name,
-        price: item.price,
-        desc: item.desc,
-        quantity: 1,
-      });
+  // ✅ NEW
+  const increaseQty = async (item: any) => {
+    try {
+      const cartRef = firestore().collection("cart");
+      const existing = await cartRef.where("name", "==", item.name).get();
+
+      if (!existing.empty) {
+        const doc = existing.docs[0];
+        await cartRef.doc(doc.id).update({ quantity: doc.data().quantity + 1 });
+      } else {
+        await cartRef.add({
+          name: item.name,
+          price: item.price,
+          desc: item.desc,
+          quantity: 1,
+        });
+      }
+    } catch (err: any) {
+      Alert.alert("Error", err.message);
     }
+  };
 
-    navigation.navigate("Cart");
-  } catch (err: any) {
-    Alert.alert("Error", err.message);
-  }
-};
+  // ✅ NEW
+  const decreaseQty = async (name: string) => {
+    try {
+      const cartRef = firestore().collection("cart");
+      const existing = await cartRef.where("name", "==", name).get();
+
+      if (!existing.empty) {
+        const doc = existing.docs[0];
+        const qty = doc.data().quantity;
+        if (qty <= 1) {
+          await cartRef.doc(doc.id).delete();
+        } else {
+          await cartRef.doc(doc.id).update({ quantity: qty - 1 });
+        }
+      }
+    } catch (err: any) {
+      Alert.alert("Error", err.message);
+    }
+  };
 
   const menu: any = {
     SNACKS: [
@@ -108,6 +140,7 @@ export default function MMLibraryCategoryScreen({ route, navigation }: any) {
         {/* LIST */}
         {items.map((item: any, index: number) => {
           const isUnavailable = unavailableItems.includes(item.name);
+          const qty = quantities[item.name] || 0; // ✅ NEW
 
           return (
             <View
@@ -129,15 +162,41 @@ export default function MMLibraryCategoryScreen({ route, navigation }: any) {
                 </Text>
               )}
 
-              <TouchableOpacity
-                style={[styles.button, isUnavailable && { backgroundColor: "#ccc" }]}
-                disabled={isUnavailable}
-                onPress={() => addToCart(item)}
-              >
-                <Text style={styles.buttonText}>
-                  {isUnavailable ? "Unavailable" : "Add To Tummy"}
-                </Text>
-              </TouchableOpacity>
+              {/* ✅ NEW — stepper replaces button once item is in cart */}
+              {!isUnavailable && qty > 0 ? (
+                <View style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: "#DF401C",
+                  borderRadius: 8,
+                  paddingVertical: 8,
+                }}>
+                  <TouchableOpacity
+                    onPress={() => decreaseQty(item.name)}
+                    style={{ paddingHorizontal: 18 }}
+                  >
+                    <Text style={{ color: "#fff", fontSize: 18, fontWeight: "bold" }}>-</Text>
+                  </TouchableOpacity>
+                  <Text style={{ color: "#fff", fontSize: 16, fontWeight: "bold" }}>{qty}</Text>
+                  <TouchableOpacity
+                    onPress={() => increaseQty(item)}
+                    style={{ paddingHorizontal: 18 }}
+                  >
+                    <Text style={{ color: "#fff", fontSize: 18, fontWeight: "bold" }}>+</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <TouchableOpacity
+                  style={[styles.button, isUnavailable && { backgroundColor: "#ccc" }]}
+                  disabled={isUnavailable}
+                  onPress={() => increaseQty(item)}
+                >
+                  <Text style={styles.buttonText}>
+                    {isUnavailable ? "Unavailable" : "Add To Tummy"}
+                  </Text>
+                </TouchableOpacity>
+              )}
             </View>
           );
         })}

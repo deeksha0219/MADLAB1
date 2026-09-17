@@ -2,14 +2,41 @@ import { StyleSheet } from "react-native";
 const ORANGE = "#DF401C";
 
 export const splashStyles = StyleSheet.create({
-  container:{flex:1,backgroundColor:"#F63204",alignItems:"center",justifyContent:"center"},
-  logoContainer:{position:"absolute",top:"28%"},
-  logo:{width:220,height:220},
-  tagline:{position:"absolute",top:"60%",fontSize:24,color:"white"},
-  bottomContainer:{position:"absolute",bottom:60},
-  foodEmojis:{fontSize:32},
-  loading:{fontSize:18,color:"white"}
+  container: {
+    flex: 1,
+    backgroundColor: "#F63204",
+    alignItems: "center",
+    justifyContent: "center",  // ✅ centers everything
+  },
+  logoContainer: {
+    alignItems: "center",
+    marginBottom: 20,          // ✅ space between logo and tagline
+  },
+  logo: {
+    width: 220,
+    height: 220,
+  },
+  tagline: {
+    fontSize: 24,
+    color: "white",
+    fontWeight: "bold",
+    marginTop: 10,
+  },
+  bottomContainer: {
+    position: "absolute",
+    bottom: 60,
+    alignItems: "center",
+  },
+  foodEmojis: {
+    fontSize: 32,
+  },
+  loading: {
+    fontSize: 18,
+    color: "white",
+    marginTop: 8,
+  },
 });
+
 
 
 const GREY = "#D9D9D9";
@@ -56,16 +83,16 @@ export const loginStyles = StyleSheet.create({
   phoneInput: {
     flex: 1,
     padding: 12,
-    fontSize: 16
+    fontSize: 14
   },
 
   otpButton: {
-    width: 90,
+    width: 80,
     backgroundColor: ORANGE,
     paddingVertical: 14,
     paddingHorizontal: 20,
     borderRadius: 10,
-    marginLeft: 20,
+    marginLeft: 0,
   },
 
   otpButtonText: {
@@ -77,20 +104,21 @@ export const loginStyles = StyleSheet.create({
     width: "88%",
     backgroundColor: GREY,
     marginTop: 25,
+    fontSize: 14,
     borderRadius: 14,
     paddingHorizontal: 14,
     height: 55
   },
 
   resendText: {
-  fontSize: 16,
+  fontSize: 14,
 },
 
 resend: {
   color: "#E53935",
   fontWeight: "500",
-  fontSize: 16,        // ✅ match font size
-  lineHeight: 50,      // ✅ match line height
+  fontSize: 16,        
+  lineHeight: 50,      
 },
 
   verifyButton: {
@@ -109,6 +137,13 @@ resend: {
     fontWeight: "700"
   },
 
+  scrollContent: {
+    flexGrow: 1,
+    alignItems: "center",
+    paddingTop: 20,
+    paddingBottom: 30,
+  },
+
   firstTime: {
     marginTop: 40,
     fontSize: 16
@@ -125,27 +160,35 @@ resend: {
 roleContainer: {
   flexDirection: "row",
   alignSelf: "center",
-  marginVertical: 20,
+  marginTop: 35,
 },
 
 studentButton: {
-  paddingVertical: 12,
-  paddingHorizontal: 45,
+  width: 200,
+  height: 40,
+  backgroundColor: "#D9D9D9",
+
+  justifyContent: "center",
+  alignItems: "center",
+
   borderTopLeftRadius: 12,
   borderBottomLeftRadius: 12,
-  borderTopRightRadius: 20,
-  borderBottomRightRadius: 20,
-  marginRight: -10,
-  zIndex: 1,
+  borderTopRightRadius: 10,
+  borderBottomRightRadius: 10,
 },
 
 adminButton: {
-  paddingVertical: 12,
-  paddingHorizontal: 45,
+  width: 200,
+  height: 40,
+  backgroundColor: "#F4430E",
+
+  justifyContent: "center",
+  alignItems: "center",
+
   borderTopRightRadius: 12,
   borderBottomRightRadius: 12,
-  borderTopLeftRadius: 20,
-  borderBottomLeftRadius: 20,
+  borderTopLeftRadius: 10,
+  borderBottomLeftRadius: 10,
 },
 
 studentText: {
@@ -159,6 +202,29 @@ adminText: {
   fontSize: 20,
   fontWeight: "700",
 },
+
+passwordContainer: {
+  flexDirection: "row",
+  width: "88%",
+  backgroundColor: GREY,
+  marginTop: 25,
+  borderRadius: 14,
+  paddingHorizontal: 12,
+  alignItems: "center",
+  height: 55,           // ← matches otpInput height
+},
+
+passwordInput: {
+  flex: 1,
+  padding: 12,
+  fontSize: 16,
+},
+
+passwordToggle: {
+  padding: 8,           // tappable area for the eye icon
+},
+
+
 });
 
 
@@ -641,9 +707,10 @@ export const orderstyles = StyleSheet.create({
     marginVertical: 30,
   },
   foodImage: {
-    width: 300,
-    height: 300,
+    width: 350,
+    height: 350,
     resizeMode: "contain",
+    alignSelf: "center",
   },
   checkCircle: {
     position: "absolute",
@@ -653,11 +720,6 @@ export const orderstyles = StyleSheet.create({
     backgroundColor: "#E8F5E9",
     alignItems: "center",
     justifyContent: "center",
-  },
-  checkMark: {
-    fontSize: 40,
-    color: "green",
-    fontWeight: "bold",
   },
   title: {
     textAlign: "center",
@@ -779,15 +841,17 @@ export const orderHistoryStyles = StyleSheet.create({
   header: {
     flexDirection: "row",
     alignItems: "center",
-    padding: 15,
+    padding: 25,
+    paddingTop: 35,
     borderBottomWidth: 1,
     borderBottomColor: "#f0f0f0",
   },
 
   backBtn: {
-    fontSize: 22,
-    marginRight: 15,
-  },
+  fontSize: 22,
+  marginRight: 20,
+  marginTop: 10,
+},
 
   headerTitle: {
     fontSize: 18,

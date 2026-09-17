@@ -75,10 +75,15 @@ export default function CartScreen() {
   const [showPicker, setShowPicker] = useState(false);
 
   const formatTime = (date: Date) => {
-    const hours = date.getHours();
-    const minutes = date.getMinutes();
-    return `${hours}:${minutes < 10 ? "0" + minutes : minutes}`;
-  };
+  let hours = date.getHours();
+  const minutes = date.getMinutes();
+  const ampm = hours >= 12 ? "PM" : "AM";
+
+  hours = hours % 12;
+  hours = hours ? hours : 12;
+
+  return `${hours}:${minutes < 10 ? "0" + minutes : minutes} ${ampm}`;
+};
 
   useEffect(() => {
     const unsubscribe = firestore()
@@ -150,7 +155,7 @@ export default function CartScreen() {
         <DateTimePicker
           value={pickupTime}
           mode="time"
-          is24Hour={true}
+          is24Hour={false}
           display="default"
           onChange={(event, selectedDate) => {
             setShowPicker(false);

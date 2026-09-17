@@ -5,6 +5,7 @@ import {
 } from "react-native";
 import { Accstyles } from "../styles/Studentstyles";
 import firestore from "@react-native-firebase/firestore";
+import Feather from "react-native-vector-icons/Feather";
 
 type Props = {
   navigation: any;
@@ -17,12 +18,17 @@ export default function CreateAccountScreen({ setIsAccountDone }: Props) {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleRegister = async () => {
-    if (!collegeId || !name || !phone || !password || !confirmPassword) {
+    if (!collegeId || !name ||!phone || !password || !confirmPassword) {
       Alert.alert("Error", "Please fill all fields!");
+      return;
+    }
+    if (!collegeId.trim().toLowerCase().endsWith("@rvu.edu.in")) {
+      Alert.alert("Invalid Email", "Only @rvu.edu.in emails are allowed!");
       return;
     }
     if (phone.length !== 10) {
@@ -92,19 +98,21 @@ export default function CreateAccountScreen({ setIsAccountDone }: Props) {
         style={Accstyles.logoImage}
       />
 
-      <Text style={Accstyles.welcome}>Welcome! 👋</Text>
+      <Text style={Accstyles.welcome}> Welcome! 👋</Text>
       <Text style={Accstyles.subtitle}>Ready to skip the queue today? </Text>
 
       <View style={Accstyles.card}>
         <Text style={Accstyles.cardTitle}>Create Account </Text>
 
         <TextInput
-          placeholder="Enter your College ID"
+          placeholder="Enter your RVU Email ID"
           placeholderTextColor="#555"
           style={Accstyles.input}
           value={collegeId}
           onChangeText={setCollegeId}
+          autoCapitalize="none"
         />
+      
         <TextInput
           placeholder="Full Name"
           placeholderTextColor="#555"
@@ -112,6 +120,7 @@ export default function CreateAccountScreen({ setIsAccountDone }: Props) {
           value={name}
           onChangeText={setName}
         />
+        
         <TextInput
           placeholder="Phone Number"
           placeholderTextColor="#555"
@@ -121,22 +130,57 @@ export default function CreateAccountScreen({ setIsAccountDone }: Props) {
           value={phone}
           onChangeText={setPhone}
         />
-        <TextInput
-          placeholder="Create Password"
-          placeholderTextColor="#555"
-          secureTextEntry
-          style={Accstyles.input}
-          value={password}
-          onChangeText={setPassword}
-        />
-        <TextInput
-          placeholder="Confirm Password"
-          placeholderTextColor="#555"
-          secureTextEntry
-          style={Accstyles.input}
-          value={confirmPassword}
-          onChangeText={setConfirmPassword}
-        />
+        <View style={{ position: "relative" }}>
+          <TextInput
+            placeholder="Create Password"
+            placeholderTextColor="#555"
+            secureTextEntry={!showPassword}
+            style={Accstyles.input}
+            value={password}
+            onChangeText={setPassword}
+          />
+
+          <TouchableOpacity
+            onPress={() => setShowPassword(!showPassword)}
+            style={{
+              position: "absolute",
+              right: 18,
+              top: 12,
+            }}
+          >
+            <Feather
+              name={showPassword ? "eye" : "eye-off"}
+              size={20}
+              color="#555"
+            />
+          </TouchableOpacity>
+        </View>
+
+        <View style={{ position: "relative" }}>
+          <TextInput
+            placeholder="Confirm Password"
+            placeholderTextColor="#555"
+            secureTextEntry={!showPassword}
+            style={Accstyles.input}
+            value={confirmPassword}
+            onChangeText={setConfirmPassword}
+          />
+
+          <TouchableOpacity
+            onPress={() => setShowPassword(!showPassword)}
+            style={{
+              position: "absolute",
+              right: 18,
+              top: 12,
+            }}
+          >
+            <Feather
+              name={showPassword ? "eye" : "eye-off"}
+              size={20}
+              color="#555"
+            />
+          </TouchableOpacity>
+        </View>
 
         <TouchableOpacity
           style={[Accstyles.button, loading && { opacity: 0.6 }]}
@@ -153,7 +197,7 @@ export default function CreateAccountScreen({ setIsAccountDone }: Props) {
 
       <TouchableOpacity onPress={() => setIsAccountDone(true)}>
         <Text style={Accstyles.footer}>        Already have an Account?{" "}
-          <Text style={Accstyles.login}>LOGIN</Text>
+          <Text style={Accstyles.login}> LOGIN </Text>
         </Text>
       </TouchableOpacity>
 

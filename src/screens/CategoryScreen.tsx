@@ -8,8 +8,8 @@ import firestore from "@react-native-firebase/firestore";
 export default function CategoryScreen({ route, navigation }: any) {
   const { category } = route.params;
 
-  // 🔥 availability from Firestore
   const [availabilityMap, setAvailabilityMap] = useState<any>({});
+  const [quantities, setQuantities] = useState<{ [key: string]: number }>({}); // ✅ NEW
 
   useEffect(() => {
     const unsubscribe = firestore()
@@ -27,7 +27,58 @@ export default function CategoryScreen({ route, navigation }: any) {
     return () => unsubscribe();
   }, [category]);
 
-  // ✅ your original menu (UNCHANGED)
+  // ✅ NEW — sync cart quantities live from Firestore
+  useEffect(() => {
+    const unsubscribe = firestore()
+      .collection("cart")
+      .onSnapshot(snap => {
+        const qtys: { [key: string]: number } = {};
+        snap.docs.forEach(doc => {
+          const data = doc.data();
+          qtys[data.name] = data.quantity;
+        });
+        setQuantities(qtys);
+      });
+    return () => unsubscribe();
+  }, []);
+
+  // ✅ NEW
+  const increaseQty = async (name: string, price: number) => {
+    try {
+      const cartRef = firestore().collection("cart");
+      const existing = await cartRef.where("name", "==", name).get();
+
+      if (!existing.empty) {
+        const doc = existing.docs[0];
+        await cartRef.doc(doc.id).update({ quantity: doc.data().quantity + 1 });
+      } else {
+        await cartRef.add({ name, price, quantity: 1 });
+      }
+    } catch (err: any) {
+      Alert.alert("❌ Error", err.message);
+    }
+  };
+
+  // ✅ NEW
+  const decreaseQty = async (name: string) => {
+    try {
+      const cartRef = firestore().collection("cart");
+      const existing = await cartRef.where("name", "==", name).get();
+
+      if (!existing.empty) {
+        const doc = existing.docs[0];
+        const qty = doc.data().quantity;
+        if (qty <= 1) {
+          await cartRef.doc(doc.id).delete();
+        } else {
+          await cartRef.doc(doc.id).update({ quantity: qty - 1 });
+        }
+      }
+    } catch (err: any) {
+      Alert.alert("❌ Error", err.message);
+    }
+  };
+
   const menu: any = {
     SNACKS: [
       { name: "Potato Bites", price: 80, desc: "Golden crispy potato bites perfect for snacking", image: require("../../assets/potato_bites.png") },
@@ -93,13 +144,14 @@ export default function CategoryScreen({ route, navigation }: any) {
         {/* ITEMS */}
         {items.map((item: any, index: number) => {
           const isAvailable = availabilityMap[item.name] !== false;
+          const qty = quantities[item.name] || 0; // ✅ NEW
 
           return (
             <View
               key={index}
               style={[
                 styles.card,
-                !isAvailable && { opacity: 0.5 } // grey effect
+                !isAvailable && { opacity: 0.5 }
               ]}
             >
               <Image source={item.image} style={styles.image} />
@@ -117,40 +169,44 @@ export default function CategoryScreen({ route, navigation }: any) {
                 </Text>
               )}
 
-              <TouchableOpacity
-                disabled={!isAvailable}
-                style={[
-                  styles.button,
-                  !isAvailable && { backgroundColor: "#ccc" }
-                ]}
-                onPress={async () => {
-                  try {
-                    const cartRef = firestore().collection("cart");
-                    const existing = await cartRef.where("name", "==", item.name).get();
-
-                    if (!existing.empty) {
-                      const doc = existing.docs[0];
-                      await cartRef.doc(doc.id).update({
-                        quantity: doc.data().quantity + 1,
-                      });
-                    } else {
-                      await cartRef.add({
-                        name: item.name,
-                        price: item.price,
-                        quantity: 1,
-                      });
-                    }
-
-                    navigation.navigate("Cart");
-                  } catch (err: any) {
-                    Alert.alert("❌ Error", err.message);
-                  }
-                }}
-              >
-                <Text style={styles.buttonText}>
-                  {isAvailable ? "Add To Tummy" : "Unavailable"}
-                </Text>
-              </TouchableOpacity>
+              {/* ✅ NEW — stepper replaces button once item is in cart */}
+              {isAvailable && qty > 0 ? (
+                <View style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: "#DF401C",
+                  borderRadius: 8,
+                  paddingVertical: 8,
+                }}>
+                  <TouchableOpacity
+                    onPress={() => decreaseQty(item.name)}
+                    style={{ paddingHorizontal: 18 }}
+                  >
+                    <Text style={{ color: "#fff", fontSize: 18, fontWeight: "bold" }}>-</Text>
+                  </TouchableOpacity>
+                  <Text style={{ color: "#fff", fontSize: 16, fontWeight: "bold" }}>{qty}</Text>
+                  <TouchableOpacity
+                    onPress={() => increaseQty(item.name, item.price)}
+                    style={{ paddingHorizontal: 18 }}
+                  >
+                    <Text style={{ color: "#fff", fontSize: 18, fontWeight: "bold" }}>+</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <TouchableOpacity
+                  disabled={!isAvailable}
+                  style={[
+                    styles.button,
+                    !isAvailable && { backgroundColor: "#ccc" }
+                  ]}
+                  onPress={() => increaseQty(item.name, item.price)}
+                >
+                  <Text style={styles.buttonText}>
+                    {isAvailable ? "Add To Tummy" : "Unavailable"}
+                  </Text>
+                </TouchableOpacity>
+              )}
 
             </View>
           );

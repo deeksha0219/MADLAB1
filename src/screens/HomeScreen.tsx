@@ -229,9 +229,7 @@ export default function HomeScreen() {
                 <TouchableOpacity onPress={() => setSearchText("")}>
                   <MaterialIcon name="close" size={22} color="black" />
                 </TouchableOpacity>
-              ) : (
-                <MaterialIcon name="mic" size={24} color="black" />
-              )}
+              ) :(null)}
             </View>
             <View style={{ flexDirection: "row", alignItems: "center", marginLeft: 10 }}>
               <Text style={{ marginRight: 6, fontWeight: "bold", color: isEnabled ? "green" : "red" }}>

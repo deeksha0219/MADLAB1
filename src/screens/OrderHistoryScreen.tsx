@@ -66,6 +66,8 @@ interface OrderItem {
 
 interface Order {
   id: string;
+  orderId?: string;
+  referenceId?: string;
   items: OrderItem[];
   total: number;
   placedAt: any;
@@ -114,6 +116,17 @@ export default function OrderHistoryScreen() {
   const renderOrder = ({ item }: { item: Order }) => (
     <View style={styles.orderCard}>
       <Text style={styles.orderDate}>🕐 {formatDate(item.placedAt)}</Text>
+
+      {/* Order ID / Reference ID */}
+      <View style={{ flexDirection: "row", justifyContent: "space-between", marginBottom: 8 }}>
+        <Text style={{ fontSize: 12, color: "gray" }}>
+          Order ID: <Text style={{ fontWeight: "bold", color: "#333" }}>{(item as any).orderId || "—"}</Text>
+        </Text>
+        <Text style={{ fontSize: 12, color: "gray" }}>
+          Ref: <Text style={{ fontWeight: "bold", color: "#333" }}>{(item as any).referenceId || "—"}</Text>
+        </Text>
+      </View>
+
       {item.items.map((food, index) => (
         <View key={index} style={styles.itemRow}>
           <Image
@@ -132,7 +145,34 @@ export default function OrderHistoryScreen() {
         <Text style={styles.totalText}>Total: ₹{item.total}</Text>
         <TouchableOpacity
           style={styles.reorderBtn}
-          onPress={() => navigation.navigate("Home")}
+          onPress={async () => {
+            try {
+              const cartRef = firestore().collection("cart");
+
+              for (const food of item.items) {
+                const existing = await cartRef
+                  .where("name", "==", food.name)
+                  .get();
+
+                if (!existing.empty) {
+                  const doc = existing.docs[0];
+                  await cartRef.doc(doc.id).update({
+                    quantity: doc.data().quantity + food.quantity,
+                  });
+                } else {
+                  await cartRef.add({
+                    name: food.name,
+                    price: food.price,
+                    quantity: food.quantity,
+                  });
+                }
+              }
+
+              navigation.navigate("Cart");
+            } catch (err) {
+              console.log(err);
+            }
+          }}
         >
           <Text style={styles.reorderIcon}>↻</Text>
           <Text style={styles.reorderText}>Reorder</Text>
