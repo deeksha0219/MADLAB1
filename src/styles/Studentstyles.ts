@@ -68,15 +68,15 @@ export const loginStyles = StyleSheet.create({
   },
 
   phoneContainer: {
-    flexDirection: "row",
-    width: "100%",
-    backgroundColor: GREY,
-    marginTop: 50,
-    borderRadius: 14,
-    paddingHorizontal: 3,
-    height: 66,
-    alignItems: "center"
-  },
+  flexDirection: "row",
+  width: "115%",
+  backgroundColor: GREY,
+  marginTop: 50,
+  borderRadius: 14,
+  paddingHorizontal: 3,
+  height: 66,
+  alignItems: "center"
+},
 
   countryCode: {
     fontSize: 12
@@ -106,14 +106,14 @@ export const loginStyles = StyleSheet.create({
   },
 
   otpInput: {
-    width: "100%",
-    backgroundColor: GREY,
-    marginTop: 25,
-    fontSize: 12,
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    height: 66,
-  },
+  width: "115%",
+  backgroundColor: GREY,
+  marginTop: 25,
+  fontSize: 12,
+  borderRadius: 14,
+  paddingHorizontal: 14,
+  height: 66,
+},
 
   resendText: {
     fontSize: 14,
@@ -449,7 +449,7 @@ export const categoryStyles = StyleSheet.create({
     fontWeight: "bold",
     color: "#000"
   },
-  
+
   cartBar: {
   position: "absolute",
   bottom: 12,
