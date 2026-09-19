@@ -14,19 +14,14 @@ import { loginStyles } from "../styles/Studentstyles";
 import { getFirestore, collection, query, where, getDocs } from "@react-native-firebase/firestore";
 import auth from '@react-native-firebase/auth';
 import { getApp } from "@react-native-firebase/app";
-import Feather from "react-native-vector-icons/Feather";
 
 type Props = {
   setRole: (role: "student" | "Service Desk") => void;
 };
 
 export default function LoginScreen({ setRole }: Props) {
-  const [selectedRole, setSelectedRole] = useState<"student" | "admin">("student");
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState("");
-  const [showAdminPassword, setShowAdminPassword] = useState(false);
-  const [adminId, setAdminId] = useState("");
-  const [adminPassword, setAdminPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [otpSent, setOtpSent] = useState(false);
   const [confirm, setConfirm] = useState<any>(null);
@@ -89,177 +84,77 @@ export default function LoginScreen({ setRole }: Props) {
     }
   };
 
-  const handleAdminLogin = async () => {
-    if (!adminId || !adminPassword) {
-      Alert.alert("Error", "Fill all fields!");
-      return;
-    }
-    setLoading(true);
-    try {
-      const snap = await getDocs(
-        query(
-          collection(db, "admin"),
-          where("adminId", "==", adminId),
-          where("password", "==", adminPassword)
-        )
-      );
-      if (!snap.empty) {
-        setRole("Service Desk");
-      } else {
-        Alert.alert("Error", "Invalid Admin ID or Password!");
-      }
-    } catch (err: any) {
-      Alert.alert("Error", "Login failed!");
-    } finally {
-      setLoading(false);
-    }
-  };
-
   return (
     <SafeAreaView style={loginStyles.container}>
-      
+
       <ScrollView
         contentContainerStyle={loginStyles.scrollContent}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
-         bounces={false}
+        bounces={false}
       >
         <Image source={require("../../assets/logo_text.png")} style={loginStyles.logo} resizeMode="contain" />
         <Text style={loginStyles.welcome}>Welcome! 👋</Text>
         <Text style={loginStyles.subText}>Ready to skip the queue today? </Text>
 
-        {/* ROLE TABS */}
-        <View style={loginStyles.roleContainer}>
+        <View style={loginStyles.phoneContainer}>
+          <Text style={loginStyles.countryCode}>+91 |</Text>
+          <TextInput
+            placeholder="Enter Mobile Number"
+            placeholderTextColor="#555"
+            style={loginStyles.phoneInput}
+            keyboardType="number-pad"
+            maxLength={10}
+            value={phone}
+            onChangeText={setPhone}
+            editable={!otpSent}
+          />
           <TouchableOpacity
-            style={[
-              loginStyles.studentButton,
-              { backgroundColor: selectedRole === "student" ? "#E6330A" : "#ccc" },
-            ]}
-            onPress={() => {
-              setSelectedRole("student");
-              setOtpSent(false);
-              setPhone("");
-              setOtp("");
-              setConfirm(null);
-            }}
+            style={[loginStyles.otpButton, otpSent && { backgroundColor: "gray" }]}
+            onPress={otpSent ? undefined : handleSendOtp}
+            disabled={loading || otpSent}
           >
-            <Text style={[loginStyles.studentText, { color: selectedRole === "student" ? "#fff" : "#555" }]}>
-              Student
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[
-              loginStyles.adminButton,
-              { backgroundColor: selectedRole === "admin" ? "#E6330A" : "#ccc" },
-            ]}
-            onPress={() => setSelectedRole("admin")}
-          >
-            <Text style={[loginStyles.adminText, { color: selectedRole === "admin" ? "#fff" : "#555" }]}>
-              Service Desk
-            </Text>
+            {loading && !otpSent
+              ? <ActivityIndicator color="#fff" size="small" />
+              : <Text style={loginStyles.otpButtonText}>{otpSent ? "Sent ✓" : " Get OTP"}</Text>
+            }
           </TouchableOpacity>
         </View>
 
-        {selectedRole === "student" ? (
-          <>
-            <View style={loginStyles.phoneContainer}>
-              <Text style={loginStyles.countryCode}>+91 |</Text>
-              <TextInput
-                placeholder="Enter Your Mobile Number"
-                placeholderTextColor="#555"
-                style={loginStyles.phoneInput}
-                keyboardType="number-pad"
-                maxLength={10}
-                value={phone}
-                onChangeText={setPhone}
-                editable={!otpSent}
-              />
-              <TouchableOpacity
-                style={[loginStyles.otpButton, otpSent && { backgroundColor: "gray" }]}
-                onPress={otpSent ? undefined : handleSendOtp}
-                disabled={loading || otpSent}
-              >
-                {loading && !otpSent
-                  ? <ActivityIndicator color="#fff" size="small" />
-                  : <Text style={loginStyles.otpButtonText}>{otpSent ? "Sent ✓" : " Get OTP"}</Text>
-                }
-              </TouchableOpacity>
-            </View>
+        <TextInput
+          placeholder="Enter OTP"
+          placeholderTextColor="#555"
+          style={loginStyles.otpInput}
+          keyboardType="number-pad"
+          maxLength={6}
+          value={otp}
+          onChangeText={setOtp}
+        />
 
-            <TextInput
-              placeholder="Enter OTP"
-              placeholderTextColor="#555"
-              style={loginStyles.otpInput}
-              keyboardType="number-pad"
-              maxLength={6}
-              value={otp}
-              onChangeText={setOtp}
-            />
+        <View style={{ flexDirection: "row", marginTop: 12, alignItems: "center" }}>
+          <Text style={loginStyles.resendText}>
+            Didn't receive OTP? </Text>
+          <Text
+            style={loginStyles.resend}
+            onPress={() => {
+              setOtpSent(false);
+              setOtp("");
+              setConfirm(null);
+              handleSendOtp();
+            }}>{" "}Resend</Text>
+        </View>
 
-            <View style={{ flexDirection: "row", marginTop: 12, alignItems: "center" }}>
-              <Text style={loginStyles.resendText}>
-                Didn't receive OTP? </Text>
-              <Text
-                style={loginStyles.resend}
-                onPress={() => {
-                  setOtpSent(false);
-                  setOtp("");
-                  setConfirm(null);
-                  handleSendOtp(); // ✅ actually resend
-                }}>{" "}Resend</Text>
-            </View>
+        <TouchableOpacity
+          style={[loginStyles.verifyButton, loading && { opacity: 0.6 }]}
+          onPress={handleVerifyOtp}
+          disabled={loading}
+        >
+          {loading && otpSent
+            ? <ActivityIndicator color="#fff" />
+            : <Text style={loginStyles.verifyButtonText}>VERIFY OTP</Text>
+          }
+        </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[loginStyles.verifyButton, loading && { opacity: 0.6 }]}
-              onPress={handleVerifyOtp}
-              disabled={loading}
-            >
-              {loading && otpSent
-                ? <ActivityIndicator color="#fff" />
-                : <Text style={loginStyles.verifyButtonText}>VERIFY OTP</Text>
-              }
-            </TouchableOpacity>
-          </>
-        ) : (
-          <>
-            <TextInput placeholder="Admin ID" placeholderTextColor="#555" style={loginStyles.otpInput} value={adminId} onChangeText={setAdminId} />
-            <View style={loginStyles.passwordContainer}>
-              <TextInput
-                placeholder="Password"
-                placeholderTextColor="#555"
-                style={loginStyles.passwordInput}
-                secureTextEntry={!showAdminPassword}
-                value={adminPassword}
-                onChangeText={setAdminPassword}
-              />
-              <TouchableOpacity onPress={() => setShowAdminPassword(!showAdminPassword)}>
-                <Feather name={showAdminPassword ? "eye" : "eye-off"} size={20} color="#555" />
-              </TouchableOpacity>
-            </View>
-
-            <TouchableOpacity
-              style={[loginStyles.verifyButton, loading && { opacity: 0.6 }]}
-              onPress={handleAdminLogin}
-              disabled={loading}
-            >
-              {loading ? <ActivityIndicator color="#fff" /> : <Text style={loginStyles.verifyButtonText}> LOGIN</Text>}
-            </TouchableOpacity>
-
-            <Text style={loginStyles.resendText}>
-              Forgot Password?{" "}
-              <Text
-                style={loginStyles.resend}
-                onPress={() =>
-                  Alert.alert(
-                    "Contact Admin",
-                    "Please contact your administrator to reset your password.\n\n📞 Admin: +91 XXXXXXXXXX",
-                    [{ text: "OK" }])}> Contact Admin </Text>
-            </Text>
-          </>
-        )}
-              <View style={{ height: 1200, backgroundColor: "red" }} />  
-      
       </ScrollView>
     </SafeAreaView>
   );

@@ -1,5 +1,12 @@
 import React, { useEffect, useState } from "react";
-import { View, Text, Image, TouchableOpacity, ScrollView, Alert } from "react-native";
+import {
+  View,
+  Text,
+  Image,
+  TouchableOpacity,
+  ScrollView,
+  Alert,
+} from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import MaterialIcon from "react-native-vector-icons/MaterialIcons";
 import { categoryStyles as styles } from "../styles/Studentstyles";
@@ -9,69 +16,103 @@ export default function CategoryScreen({ route, navigation }: any) {
   const { category } = route.params;
 
   const [availabilityMap, setAvailabilityMap] = useState<any>({});
-  const [quantities, setQuantities] = useState<{ [key: string]: number }>({}); // ✅ NEW
+  const [quantities, setQuantities] = useState<{ [key: string]: number }>({});
+
+  // --------------------------------------------------
+  // CHECK FOOD AVAILABILITY
+  // --------------------------------------------------
 
   useEffect(() => {
     const unsubscribe = firestore()
       .collection("menu")
       .where("category", "==", category)
-      .onSnapshot(snapshot => {
+      .onSnapshot((snapshot) => {
         const map: any = {};
-        snapshot.docs.forEach(doc => {
+
+        snapshot.docs.forEach((doc) => {
           const data = doc.data();
           map[data.name] = data.available;
         });
+
         setAvailabilityMap(map);
       });
 
     return () => unsubscribe();
   }, [category]);
 
-  // ✅ NEW — sync cart quantities live from Firestore
+  // --------------------------------------------------
+  // SYNC CART QUANTITIES FROM FIRESTORE
+  // --------------------------------------------------
+
   useEffect(() => {
     const unsubscribe = firestore()
       .collection("cart")
-      .onSnapshot(snap => {
+      .onSnapshot((snap) => {
         const qtys: { [key: string]: number } = {};
-        snap.docs.forEach(doc => {
+
+        snap.docs.forEach((doc) => {
           const data = doc.data();
           qtys[data.name] = data.quantity;
         });
+
         setQuantities(qtys);
       });
+
     return () => unsubscribe();
   }, []);
 
-  // ✅ NEW
+  // --------------------------------------------------
+  // INCREASE QUANTITY
+  // --------------------------------------------------
+
   const increaseQty = async (name: string, price: number) => {
     try {
       const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
+
+      const existing = await cartRef
+        .where("name", "==", name)
+        .get();
 
       if (!existing.empty) {
         const doc = existing.docs[0];
-        await cartRef.doc(doc.id).update({ quantity: doc.data().quantity + 1 });
+
+        await cartRef.doc(doc.id).update({
+          quantity: doc.data().quantity + 1,
+        });
       } else {
-        await cartRef.add({ name, price, quantity: 1 });
+        await cartRef.add({
+          name,
+          price,
+          quantity: 1,
+        });
       }
     } catch (err: any) {
       Alert.alert("❌ Error", err.message);
     }
   };
 
-  // ✅ NEW
+  // --------------------------------------------------
+  // DECREASE QUANTITY
+  // --------------------------------------------------
+
   const decreaseQty = async (name: string) => {
     try {
       const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
+
+      const existing = await cartRef
+        .where("name", "==", name)
+        .get();
 
       if (!existing.empty) {
         const doc = existing.docs[0];
         const qty = doc.data().quantity;
+
         if (qty <= 1) {
           await cartRef.doc(doc.id).delete();
         } else {
-          await cartRef.doc(doc.id).update({ quantity: qty - 1 });
+          await cartRef.doc(doc.id).update({
+            quantity: qty - 1,
+          });
         }
       }
     } catch (err: any) {
@@ -79,133 +120,431 @@ export default function CategoryScreen({ route, navigation }: any) {
     }
   };
 
+  // --------------------------------------------------
+  // MENU
+  // --------------------------------------------------
+
   const menu: any = {
     SNACKS: [
-      { name: "Potato Bites", price: 80, desc: "Golden crispy potato bites perfect for snacking", image: require("../../assets/potato_bites.png") },
-      { name: "Chicken Popcorn", price: 90, desc: "Juicy chicken popcorn coated in a crunchy and flavorful crust", image: require("../../assets/chicken_popcorn.png") },
-      { name: "Boiled Egg", price: 25, desc: "Two fresh boiled eggs, simple and protein rich", image: require("../../assets/eggs.png") },
-      { name: "Omelette", price: 180, desc: "Soft egg omelette filled with flavorful chicken and light spices", image: require("../../assets/Omelette.png") },
-      { name: "Peri Peri Fries", price: 120, desc: "Crispy fries seasoned with peri peri spices", image: require("../../assets/peri_peri_fries.png") },
-      { name: "Sandwich", price: 60, desc: "Fresh vegetables and cheese in a toasted bread", image: require("../../assets/sandwich.png") }
+      {
+        name: "Potato Bites",
+        price: 80,
+        desc: "Golden crispy potato bites perfect for snacking",
+        image: require("../../assets/potato_bites.png"),
+      },
+      {
+        name: "Chicken Popcorn",
+        price: 90,
+        desc: "Juicy chicken popcorn coated in a crunchy and flavorful crust",
+        image: require("../../assets/chicken_popcorn.png"),
+      },
+      {
+        name: "Boiled Egg",
+        price: 25,
+        desc: "Two fresh boiled eggs, simple and protein rich",
+        image: require("../../assets/eggs.png"),
+      },
+      {
+        name: "Omelette",
+        price: 180,
+        desc: "Soft egg omelette filled with flavorful chicken and light spices",
+        image: require("../../assets/Omelette.png"),
+      },
+      {
+        name: "Peri Peri Fries",
+        price: 120,
+        desc: "Crispy fries seasoned with peri peri spices",
+        image: require("../../assets/peri_peri_fries.png"),
+      },
+      {
+        name: "Sandwich",
+        price: 60,
+        desc: "Fresh vegetables and cheese in a toasted bread",
+        image: require("../../assets/sandwich.png"),
+      },
     ],
+
     SOUTH: [
-      { name: "Idly (2 pcs)", price: 30, desc: "Light, healthy, and perfectly steamed idly", image: require("../../assets/Idlis.png") },
-      { name: "Vada", price: 20, desc: "Crispy outside, soft inside — perfect vada", image: require("../../assets/Vada.png") },
-      { name: "Poori Saagu", price: 70, desc: "Soft, puffed pooris served with spicy saggu", image: require("../../assets/Poori_saagu.png") },
-      { name: "Akki Roti", price: 80, desc: "Soft, fluffy roti made from rice flour", image: require("../../assets/Akki_rotti.png") },
-      { name: "Ragi Roti", price: 50, desc: "Nutritious roti made from ragi flour", image: require("../../assets/Ragi_rotti.png") },
-      { name: "Aloo Bonda", price: 60, desc: "Crispy potato balls filled with spiced potatoes", image: require("../../assets/Aloo_bonda.png") },
-      { name: "Masala Dosa", price: 70, desc: "Crispy dosa with chutney and sambar", image: require("../../assets/masala_dosa.png") }
+      {
+        name: "Idly (2 pcs)",
+        price: 30,
+        desc: "Light, healthy, and perfectly steamed idly",
+        image: require("../../assets/Idlis.png"),
+      },
+      {
+        name: "Vada",
+        price: 20,
+        desc: "Crispy outside, soft inside — perfect vada",
+        image: require("../../assets/Vada.png"),
+      },
+      {
+        name: "Poori Saagu",
+        price: 70,
+        desc: "Soft, puffed pooris served with spicy saggu",
+        image: require("../../assets/Poori_saagu.png"),
+      },
+      {
+        name: "Akki Roti",
+        price: 80,
+        desc: "Soft, fluffy roti made from rice flour",
+        image: require("../../assets/Akki_rotti.png"),
+      },
+      {
+        name: "Ragi Roti",
+        price: 50,
+        desc: "Nutritious roti made from ragi flour",
+        image: require("../../assets/Ragi_rotti.png"),
+      },
+      {
+        name: "Aloo Bonda",
+        price: 60,
+        desc: "Crispy potato balls filled with spiced potatoes",
+        image: require("../../assets/Aloo_bonda.png"),
+      },
+      {
+        name: "Masala Dosa",
+        price: 70,
+        desc: "Crispy dosa with chutney and sambar",
+        image: require("../../assets/masala_dosa.png"),
+      },
     ],
+
     NORTH: [
-      { name: "Hyderabadi Chicken Biryani", price: 150, desc: "Spiced basmati rice with tender chicken", image: require("../../assets/chicken_biryani.png") },
-      { name: "Chole Bhature", price: 100, desc: "Spicy chickpeas with fried bread", image: require("../../assets/chole_bhature.png") },
-      { name: "Pav Bhaji", price: 120, desc: "Butter-loaded pav with spicy bhaji", image: require("../../assets/pav_bhaaji.png") },
+      {
+        name: "Hyderabadi Chicken Biryani",
+        price: 150,
+        desc: "Spiced basmati rice with tender chicken",
+        image: require("../../assets/chicken_biryani.png"),
+      },
+      {
+        name: "Chole Bhature",
+        price: 100,
+        desc: "Spicy chickpeas with fried bread",
+        image: require("../../assets/chole_bhature.png"),
+      },
+      {
+        name: "Pav Bhaji",
+        price: 120,
+        desc: "Butter-loaded pav with spicy bhaji",
+        image: require("../../assets/pav_bhaaji.png"),
+      },
     ],
+
     DESSERTS: [
-      { name: "Gulab Jamun", price: 50, desc: "Soft and sweet dessert", image: require("../../assets/gulab_jamun.png") },
-      { name: "Fruit Custard", price: 100, desc: "Creamy custard with fruits", image: require("../../assets/fruit_custard.png") },
-      { name: "Carrot Halwa", price: 60, desc: "Delicious carrot dessert", image: require("../../assets/carrot_halwa.png") },
-      { name: "Brownie Sundae", price: 80, desc: "Chocolate brownie with ice cream", image: require("../../assets/brownie.png") }
+      {
+        name: "Gulab Jamun",
+        price: 50,
+        desc: "Soft and sweet dessert",
+        image: require("../../assets/gulab_jamun.png"),
+      },
+      {
+        name: "Fruit Custard",
+        price: 100,
+        desc: "Creamy custard with fruits",
+        image: require("../../assets/fruit_custard.png"),
+      },
+      {
+        name: "Carrot Halwa",
+        price: 60,
+        desc: "Delicious carrot dessert",
+        image: require("../../assets/carrot_halwa.png"),
+      },
+      {
+        name: "Brownie Sundae",
+        price: 80,
+        desc: "Chocolate brownie with ice cream",
+        image: require("../../assets/brownie.png"),
+      },
     ],
+
     BEVERAGES: [
-      { name: "Coffee", price: 40, desc: "Hot coffee", image: require("../../assets/coffee.png") },
-      { name: "Tea", price: 40, desc: "Hot tea", image: require("../../assets/tea.png") },
-      { name: "Kesar Badam Milkshake", price: 50, desc: "Rich milkshake", image: require("../../assets/badam_milk.png") },
-      { name: "Butterscotch Milkshake", price: 60, desc: "Sweet shake", image: require("../../assets/butterscotch.png") },
-      { name: "Chocolate Milk", price: 60, desc: "Cold chocolate milk", image: require("../../assets/choco_milk.png") },
-      { name: "Lassi", price: 50, desc: "Refreshing drink", image: require("../../assets/lassi.png") },
-      { name: "Lime Soda", price: 30, desc: "Tangy soda", image: require("../../assets/lime.png") }
+      {
+        name: "Coffee",
+        price: 40,
+        desc: "Hot coffee",
+        image: require("../../assets/coffee.png"),
+      },
+      {
+        name: "Tea",
+        price: 40,
+        desc: "Hot tea",
+        image: require("../../assets/tea.png"),
+      },
+      {
+        name: "Kesar Badam Milkshake",
+        price: 50,
+        desc: "Rich milkshake",
+        image: require("../../assets/badam_milk.png"),
+      },
+      {
+        name: "Butterscotch Milkshake",
+        price: 60,
+        desc: "Sweet shake",
+        image: require("../../assets/butterscotch.png"),
+      },
+      {
+        name: "Chocolate Milk",
+        price: 60,
+        desc: "Cold chocolate milk",
+        image: require("../../assets/choco_milk.png"),
+      },
+      {
+        name: "Lassi",
+        price: 50,
+        desc: "Refreshing drink",
+        image: require("../../assets/lassi.png"),
+      },
+      {
+        name: "Lime Soda",
+        price: 30,
+        desc: "Tangy soda",
+        image: require("../../assets/lime.png"),
+      },
     ],
+
     CHINESE: [
-      { name: "Veg Manchurian", price: 70, desc: "Spicy veggie balls", image: require("../../assets/Veg_manchurian.png") },
-      { name: "Chilly 65", price: 90, desc: "Spicy fried bites", image: require("../../assets/chilly_65.png") },
-      { name: "Honey Chilly Potato", price: 80, desc: "Sweet & spicy potato", image: require("../../assets/honey_chilli.png") },
-      { name: "Chicken Manchurian", price: 80, desc: "Chicken in sauce", image: require("../../assets/chicken_manchurian.png") },
-      { name: "Gobi Noodles", price: 60, desc: "Noodles with gobi", image: require("../../assets/gobi.png") }
+      {
+        name: "Veg Manchurian",
+        price: 70,
+        desc: "Spicy veggie balls",
+        image: require("../../assets/Veg_manchurian.png"),
+      },
+      {
+        name: "Chilly 65",
+        price: 90,
+        desc: "Spicy fried bites",
+        image: require("../../assets/chilly_65.png"),
+      },
+      {
+        name: "Honey Chilly Potato",
+        price: 80,
+        desc: "Sweet & spicy potato",
+        image: require("../../assets/honey_chilli.png"),
+      },
+      {
+        name: "Chicken Manchurian",
+        price: 80,
+        desc: "Chicken in sauce",
+        image: require("../../assets/chicken_manchurian.png"),
+      },
+      {
+        name: "Gobi Noodles",
+        price: 60,
+        desc: "Noodles with gobi",
+        image: require("../../assets/gobi.png"),
+      },
     ],
   };
 
   const items = menu[category] || [];
 
+  // --------------------------------------------------
+  // TOTAL ITEMS IN CART
+  // --------------------------------------------------
+
+  const totalItems = Object.values(quantities).reduce(
+    (total, qty) => total + qty,
+    0
+  );
+
+  // --------------------------------------------------
+  // SCREEN
+  // --------------------------------------------------
+
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
-      <ScrollView>
+    <SafeAreaView
+      style={{
+        flex: 1,
+        backgroundColor: "#fff",
+      }}
+    >
+      <ScrollView
+        contentContainerStyle={{
+          paddingBottom: totalItems > 0 ? 80 : 20,
+        }}
+      >
 
         {/* HEADER */}
+
         <View style={styles.header}>
-          <TouchableOpacity onPress={() => navigation.goBack()}>
-            <MaterialIcon name="arrow-back" size={28} color="black" />
+          <TouchableOpacity
+            onPress={() => navigation.goBack()}
+          >
+            <MaterialIcon
+              name="arrow-back"
+              size={28}
+              color="black"
+            />
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>{category}</Text>
-          <MaterialIcon name="search" size={26} color="black" />
+
+          <Text style={styles.headerTitle}>
+            {category}
+          </Text>
+
+          <MaterialIcon
+            name="search"
+            size={26}
+            color="black"
+          />
         </View>
 
         {/* ITEMS */}
+
         {items.map((item: any, index: number) => {
-          const isAvailable = availabilityMap[item.name] !== false;
-          const qty = quantities[item.name] || 0; // ✅ NEW
+          const isAvailable =
+            availabilityMap[item.name] !== false;
+
+          const qty =
+            quantities[item.name] || 0;
 
           return (
             <View
               key={index}
               style={[
                 styles.card,
-                !isAvailable && { opacity: 0.5 }
+                !isAvailable && {
+                  opacity: 0.5,
+                },
               ]}
             >
-              <Image source={item.image} style={styles.image} />
+
+              {/* FOOD IMAGE */}
+
+              <Image
+                source={item.image}
+                style={styles.image}
+              />
+
+              {/* NAME + PRICE */}
 
               <View style={styles.row}>
-                <Text style={styles.title}>{item.name}</Text>
-                <Text style={styles.price}>₹{item.price}</Text>
+                <Text style={styles.title}>
+                  {item.name}
+                </Text>
+
+                <Text style={styles.price}>
+                  ₹{item.price}
+                </Text>
               </View>
 
-              <Text style={styles.desc}>{item.desc}</Text>
+              {/* DESCRIPTION */}
+
+              <Text style={styles.desc}>
+                {item.desc}
+              </Text>
+
+              {/* OUT OF STOCK */}
 
               {!isAvailable && (
-                <Text style={{ color: "red", fontWeight: "bold", marginBottom: 5 }}>
+                <Text
+                  style={{
+                    color: "red",
+                    fontWeight: "bold",
+                    marginBottom: 5,
+                  }}
+                >
                   Out of Stock
                 </Text>
               )}
 
-              {/* ✅ NEW — stepper replaces button once item is in cart */}
+              {/* QUANTITY STEPPER */}
+
               {isAvailable && qty > 0 ? (
-                <View style={{
-                  flexDirection: "row",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  backgroundColor: "#DF401C",
-                  borderRadius: 8,
-                  paddingVertical: 8,
-                }}>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    backgroundColor: "#DF401C",
+                    borderRadius: 8,
+                    paddingVertical: 8,
+                  }}
+                >
+
+                  {/* MINUS */}
+
                   <TouchableOpacity
-                    onPress={() => decreaseQty(item.name)}
-                    style={{ paddingHorizontal: 18 }}
+                    onPress={() =>
+                      decreaseQty(item.name)
+                    }
+                    style={{
+                      paddingHorizontal: 18,
+                    }}
                   >
-                    <Text style={{ color: "#fff", fontSize: 18, fontWeight: "bold" }}>-</Text>
+                    <Text
+                      style={{
+                        color: "#fff",
+                        fontSize: 18,
+                        fontWeight: "bold",
+                      }}
+                    >
+                      -
+                    </Text>
                   </TouchableOpacity>
-                  <Text style={{ color: "#fff", fontSize: 16, fontWeight: "bold" }}>{qty}</Text>
+
+                  {/* QUANTITY */}
+
+                  <Text
+                    style={{
+                      color: "#fff",
+                      fontSize: 16,
+                      fontWeight: "bold",
+                    }}
+                  >
+                    {qty}
+                  </Text>
+
+                  {/* PLUS */}
+
                   <TouchableOpacity
-                    onPress={() => increaseQty(item.name, item.price)}
-                    style={{ paddingHorizontal: 18 }}
+                    onPress={() =>
+                      increaseQty(
+                        item.name,
+                        item.price
+                      )
+                    }
+                    style={{
+                      paddingHorizontal: 18,
+                    }}
                   >
-                    <Text style={{ color: "#fff", fontSize: 18, fontWeight: "bold" }}>+</Text>
+                    <Text
+                      style={{
+                        color: "#fff",
+                        fontSize: 18,
+                        fontWeight: "bold",
+                      }}
+                    >
+                      +
+                    </Text>
                   </TouchableOpacity>
+
                 </View>
               ) : (
+
+                /* ADD TO TUMMY */
+
                 <TouchableOpacity
                   disabled={!isAvailable}
                   style={[
                     styles.button,
-                    !isAvailable && { backgroundColor: "#ccc" }
+                    !isAvailable && {
+                      backgroundColor: "#ccc",
+                    },
                   ]}
-                  onPress={() => increaseQty(item.name, item.price)}
+                  onPress={() =>
+                    increaseQty(
+                      item.name,
+                      item.price
+                    )
+                  }
                 >
                   <Text style={styles.buttonText}>
-                    {isAvailable ? "Add To Tummy" : "Unavailable"}
+                    {isAvailable
+                      ? "Add To Tummy"
+                      : "Unavailable"}
                   </Text>
                 </TouchableOpacity>
+
               )}
 
             </View>
@@ -213,6 +552,68 @@ export default function CategoryScreen({ route, navigation }: any) {
         })}
 
       </ScrollView>
+
+      {/* ================================================== */}
+      {/* BOTTOM CART BAR */}
+      {/* ================================================== */}
+
+      {totalItems > 0 && (
+        <View
+          style={{
+            position: "absolute",
+            bottom: 12,
+            left: 12,
+            right: 12,
+            height: 48,
+            backgroundColor: "#DF401C",
+            borderRadius: 10,
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+            paddingHorizontal: 20,
+            elevation: 10,
+            zIndex: 999,
+          }}
+        >
+          <Text
+            style={{
+              color: "#000",
+              fontSize: 15,
+              fontWeight: "600",
+            }}
+          >
+            {totalItems} Item added
+          </Text>
+
+          <TouchableOpacity
+            onPress={() =>
+              navigation.navigate("Cart")
+            }
+            activeOpacity={0.7}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+            }}
+          >
+            <Text
+              style={{
+                color: "#000",
+                fontSize: 15,
+                fontWeight: "600",
+              }}
+            >
+              View cart
+            </Text>
+
+            <MaterialIcon
+              name="keyboard-arrow-up"
+              size={22}
+              color="#000"
+            />
+          </TouchableOpacity>
+        </View>
+      )}
+
     </SafeAreaView>
   );
 }

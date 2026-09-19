@@ -12,7 +12,6 @@ import CartScreen from "../screens/CartScreen";
 import PaymentScreen from "../screens/PaymentScreen";
 import OrderHistoryScreen from "../screens/OrderHistoryScreen";
 import OrderConfirmed from "../screens/OrderConfirmedScreen";
-import AdminHomeScreen from "../screens/AdminHomeScreen";
 import MMAdminBlockScreen from "../screens/MMAdminBlockScreen";
 import MMLibraryScreen from "../screens/MMLibraryScreen";
 import MMAdminCategoryScreen from "../screens/MMAdminCategoryScreen";
@@ -88,9 +87,7 @@ export default function AppNavigator() {
 
         ) : (
           <>
-            <Stack.Screen name="AdminHome">
-              {(props: any) => <AdminHomeScreen {...props} setRole={setRole} />}
-            </Stack.Screen>
+            
           </>
         )}
 

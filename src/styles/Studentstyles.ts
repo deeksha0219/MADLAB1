@@ -46,7 +46,8 @@ export const loginStyles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#FFFFFF",
     alignItems: "center",
-    paddingTop: 60
+    paddingTop: 60,
+    paddingHorizontal: 20,
   },
 
   logo: {
@@ -68,58 +69,62 @@ export const loginStyles = StyleSheet.create({
 
   phoneContainer: {
     flexDirection: "row",
-    width: "88%",
+    width: "100%",
     backgroundColor: GREY,
-    marginTop: 40,
+    marginTop: 50,
     borderRadius: 14,
-    paddingHorizontal: 12,
+    paddingHorizontal: 3,
+    height: 66,
     alignItems: "center"
   },
 
   countryCode: {
-    fontSize: 16
+    fontSize: 12
   },
 
   phoneInput: {
     flex: 1,
-    padding: 12,
-    fontSize: 14
+    padding: 10,
+    fontSize: 12
   },
 
   otpButton: {
-    width: 80,
+    minWidth: 9,
     backgroundColor: ORANGE,
-    paddingVertical: 14,
-    paddingHorizontal: 20,
+    paddingVertical: 22,
+    paddingHorizontal: 10,
     borderRadius: 10,
     marginLeft: 0,
+    alignItems: "center",
+    justifyContent: "center",
   },
 
   otpButtonText: {
     color: "#FFF",
-    fontWeight: "600"
+    fontWeight: "600",
+    fontSize: 14,
   },
 
   otpInput: {
-    width: "88%",
+    width: "100%",
     backgroundColor: GREY,
     marginTop: 25,
-    fontSize: 14,
+    fontSize: 12,
     borderRadius: 14,
     paddingHorizontal: 14,
-    height: 55
+    height: 66,
   },
 
   resendText: {
-  fontSize: 14,
-},
+    fontSize: 14,
+  },
 
-resend: {
-  color: "#E53935",
-  fontWeight: "500",
-  fontSize: 16,        
-  lineHeight: 50,      
-},
+  resend: {
+    color: "#E53935",
+    fontWeight: "500",
+    fontSize: 16,
+    lineHeight: 50,
+  },
 
   verifyButton: {
     backgroundColor: ORANGE,
@@ -142,6 +147,7 @@ resend: {
     alignItems: "center",
     paddingTop: 20,
     paddingBottom: 30,
+    paddingHorizontal: 20,
   },
 
   firstTime: {
@@ -157,76 +163,12 @@ resend: {
     textDecorationLine: "underline"
   },
 
-roleContainer: {
-  flexDirection: "row",
-  alignSelf: "center",
-  marginTop: 35,
-},
-
-studentButton: {
-  width: 200,
-  height: 40,
-  backgroundColor: "#D9D9D9",
-
-  justifyContent: "center",
-  alignItems: "center",
-
-  borderTopLeftRadius: 12,
-  borderBottomLeftRadius: 12,
-  borderTopRightRadius: 10,
-  borderBottomRightRadius: 10,
-},
-
-adminButton: {
-  width: 200,
-  height: 40,
-  backgroundColor: "#F4430E",
-
-  justifyContent: "center",
-  alignItems: "center",
-
-  borderTopRightRadius: 12,
-  borderBottomRightRadius: 12,
-  borderTopLeftRadius: 10,
-  borderBottomLeftRadius: 10,
-},
-
-studentText: {
-  color: "#000",
-  fontSize: 20,
-  fontWeight: "700",
-},
-
-adminText: {
-  color: "#000",
-  fontSize: 20,
-  fontWeight: "700",
-},
-
-passwordContainer: {
-  flexDirection: "row",
-  width: "88%",
-  backgroundColor: GREY,
-  marginTop: 25,
-  borderRadius: 14,
-  paddingHorizontal: 12,
-  alignItems: "center",
-  height: 55,           // ← matches otpInput height
-},
-
-passwordInput: {
-  flex: 1,
-  padding: 12,
-  fontSize: 16,
-},
-
-passwordToggle: {
-  padding: 8,           // tappable area for the eye icon
-},
-
-
+  roleContainer: {
+    flexDirection: "row",
+    alignSelf: "center",
+    marginTop: 35,
+  },
 });
-
 
 export const home = StyleSheet.create({
   container: {
@@ -506,7 +448,45 @@ export const categoryStyles = StyleSheet.create({
   buttonText: {
     fontWeight: "bold",
     color: "#000"
-  }
+  },
+  
+  cartBar: {
+  position: "absolute",
+  bottom: 12,
+  left: 12,
+  right: 12,
+  height: 48,
+  backgroundColor: "#DF401C",
+  borderRadius: 10,
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "space-between",
+  paddingHorizontal: 20,
+  elevation: 6,
+  shadowOpacity: 0.2,
+  shadowRadius: 5,
+  shadowOffset: {
+    width: 0,
+    height: 2,
+  },
+},
+
+cartItemText: {
+  color: "#000",
+  fontSize: 15,
+  fontWeight: "600",
+},
+
+viewCartContainer: {
+  flexDirection: "row",
+  alignItems: "center",
+},
+
+viewCartText: {
+  color: "#000",
+  fontSize: 15,
+  fontWeight: "600",
+},
 });
 
 export const cartStyles = StyleSheet.create({
