@@ -39,11 +39,40 @@ export interface OrderItemSnapshot {
   readonly lineTotalInPaise: number;
 }
 
+export type OrderStatus =
+  | 'placed'
+  | 'payment_verified'
+  | 'accepted'
+  | 'preparing'
+  | 'ready_for_pickup'
+  | 'completed'
+  | 'cancelled'
+  | 'rejected';
+
+export type PaymentStatus =
+  | 'pending'
+  | 'demo_verified'
+  | 'failed'
+  | 'cancelled';
+
+export interface OrderStatusHistoryEvent {
+  readonly eventId: string;
+  readonly orderId: string;
+  readonly fromStatus: string;
+  readonly toStatus: string;
+  readonly actorUid: string;
+  readonly actorRole: string;
+  readonly canteenId: string;
+  readonly reason: string;
+  readonly createdAt: any;
+}
+
 export interface OrderDocument {
   readonly id: string;
   readonly orderId: string;
   readonly studentUid: string;
   readonly canteenId: string;
+  readonly pickupSlotId?: string;
   readonly pickupSlot: {
     readonly slotId: string;
     readonly pickupDate: string;
@@ -55,8 +84,8 @@ export interface OrderDocument {
   readonly subtotalInPaise: number;
   readonly totalInPaise: number;
   readonly currency: string;
-  readonly status: string;
-  readonly paymentStatus: string;
+  readonly status: OrderStatus | string;
+  readonly paymentStatus: PaymentStatus | string;
   readonly paymentMethod: string;
   readonly idempotencyKey: string;
   readonly createdAt: any;
@@ -223,6 +252,151 @@ export async function createOrderCallable(
 }
 
 /**
+ * Calls trusted 'transitionOrderStatus' Cloud Function (Step 8).
+ */
+export async function transitionOrderStatusCallable(input: {
+  orderId: string;
+  nextStatus: OrderStatus;
+  reason?: string;
+}): Promise<{
+  success: boolean;
+  isIdempotent: boolean;
+  orderId: string;
+  fromStatus?: string;
+  status: OrderStatus;
+  paymentStatus: PaymentStatus;
+}> {
+  try {
+    const callable = functions().httpsCallable('transitionOrderStatus');
+    const response = await callable(input);
+    return response.data as {
+      success: boolean;
+      isIdempotent: boolean;
+      orderId: string;
+      fromStatus?: string;
+      status: OrderStatus;
+      paymentStatus: PaymentStatus;
+    };
+  } catch (err: any) {
+    console.error('[orderService] transitionOrderStatusCallable error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Calls 'verifyDemoPayment' Cloud Function (Step 8 — Emulator-Only Demo Behavior).
+ */
+export async function verifyDemoPaymentCallable(input: {
+  orderId: string;
+}): Promise<{
+  success: boolean;
+  orderId: string;
+  status: OrderStatus;
+  paymentStatus: PaymentStatus;
+}> {
+  try {
+    const callable = functions().httpsCallable('verifyDemoPayment');
+    const response = await callable(input);
+    return response.data as {
+      success: boolean;
+      orderId: string;
+      status: OrderStatus;
+      paymentStatus: PaymentStatus;
+    };
+  } catch (err: any) {
+    console.error('[orderService] verifyDemoPaymentCallable error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Calls 'getAdminOrderQueue' Cloud Function (Step 8).
+ */
+export async function getAdminOrderQueueCallable(input: {
+  canteenId: string;
+  status?: OrderStatus;
+  limit?: number;
+  startAfterOrderId?: string;
+}): Promise<{
+  success: boolean;
+  canteenId: string;
+  count: number;
+  orders: any[];
+}> {
+  try {
+    const callable = functions().httpsCallable('getAdminOrderQueue');
+    const response = await callable(input);
+    return response.data as {
+      success: boolean;
+      canteenId: string;
+      count: number;
+      orders: any[];
+    };
+  } catch (err: any) {
+    console.error('[orderService] getAdminOrderQueueCallable error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Calls 'searchAdminOrder' Cloud Function (Step 8).
+ */
+export async function searchAdminOrderCallable(input: {
+  canteenId: string;
+  queryOrderId: string;
+}): Promise<{
+  success: boolean;
+  order: any;
+}> {
+  try {
+    const callable = functions().httpsCallable('searchAdminOrder');
+    const response = await callable(input);
+    return response.data as {
+      success: boolean;
+      order: any;
+    };
+  } catch (err: any) {
+    console.error('[orderService] searchAdminOrderCallable error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Fetches status history subcollection for an order.
+ */
+export async function getOrderStatusHistory(
+  orderId: string,
+): Promise<OrderStatusHistoryEvent[]> {
+  if (!orderId) return [];
+  try {
+    const snapshot = await firestore()
+      .collection('orders')
+      .doc(orderId)
+      .collection('statusHistory')
+      .orderBy('createdAt', 'asc')
+      .get();
+
+    return snapshot.docs.map((doc) => {
+      const d = doc.data();
+      return {
+        eventId: doc.id,
+        orderId: d.orderId || orderId,
+        fromStatus: d.fromStatus || '',
+        toStatus: d.toStatus || '',
+        actorUid: d.actorUid || '',
+        actorRole: d.actorRole || '',
+        canteenId: d.canteenId || '',
+        reason: d.reason || '',
+        createdAt: d.createdAt,
+      };
+    });
+  } catch (err) {
+    console.error('[orderService] getOrderStatusHistory error:', err);
+    return [];
+  }
+}
+
+/**
  * Fetches order history for the authenticated student using safe indexed query.
  */
 export async function getStudentOrderHistory(studentUid: string): Promise<OrderDocument[]> {
@@ -240,6 +414,7 @@ export async function getStudentOrderHistory(studentUid: string): Promise<OrderD
       orderId: data.orderId || doc.id,
       studentUid: data.studentUid,
       canteenId: data.canteenId,
+      pickupSlotId: data.pickupSlotId,
       pickupSlot: data.pickupSlot,
       itemsSnapshot: data.itemsSnapshot || [],
       subtotalInPaise: data.subtotalInPaise || 0,

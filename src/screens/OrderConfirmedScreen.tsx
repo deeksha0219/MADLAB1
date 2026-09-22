@@ -61,13 +61,22 @@ const OrderConfirmed = () => {
         </View>
       </View>
 
-      {/* Button */}
-      <TouchableOpacity
-        style={orderstyles.button}
-        onPress={() => navigation.navigate("Home")}
-      >
-        <Text style={orderstyles.buttonText}>Back To Home</Text>
-      </TouchableOpacity>
+      {/* Action Buttons */}
+      <View style={{ width: "100%", marginTop: 24, gap: 12 }}>
+        <TouchableOpacity
+          style={[orderstyles.button, { backgroundColor: "#10B981" }]}
+          onPress={() => (navigation as any).navigate("OrderHistory")}
+        >
+          <Text style={orderstyles.buttonText}>Track Order Status</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={orderstyles.button}
+          onPress={() => navigation.navigate("Home")}
+        >
+          <Text style={orderstyles.buttonText}>Back To Home</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 };

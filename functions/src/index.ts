@@ -1304,6 +1304,7 @@ export const createOrder = functions.https.onCall(
         orderId,
         studentUid,
         canteenId,
+        pickupSlotId,
         pickupSlot: pickupSlotSnapshot,
         itemsSnapshot,
         subtotalInPaise,
@@ -1339,6 +1340,22 @@ export const createOrder = functions.https.onCall(
         transaction.delete(cartRefs[idx]);
       }
 
+      // Write 5: Initial Status History Record
+      const initialHistoryRef = orderRef
+        .collection('statusHistory')
+        .doc(`${orderId}_initial_placed`);
+      transaction.set(initialHistoryRef, {
+        eventId: `${orderId}_initial_placed`,
+        orderId,
+        fromStatus: 'none',
+        toStatus: 'placed',
+        actorUid: studentUid,
+        actorRole: 'student',
+        canteenId,
+        reason: 'Order placed by student',
+        createdAt: serverTimestamp(),
+      });
+
       return {
         isRetry: false,
         orderId,
@@ -1358,4 +1375,583 @@ export const createOrder = functions.https.onCall(
   },
 );
 
+/**
+ * ============================================================================
+ * STEP 8: ORDER STATUS TRANSITIONS, ADMIN QUEUE & SEARCH
+ * ============================================================================
+ */
 
+export const VALID_ORDER_STATUSES = [
+  'placed',
+  'payment_verified',
+  'accepted',
+  'preparing',
+  'ready_for_pickup',
+  'completed',
+  'cancelled',
+  'rejected',
+] as const;
+export type OrderStatus = typeof VALID_ORDER_STATUSES[number];
+
+export const VALID_PAYMENT_STATUSES = [
+  'pending',
+  'demo_verified',
+  'failed',
+  'cancelled',
+] as const;
+export type PaymentStatus = typeof VALID_PAYMENT_STATUSES[number];
+
+/**
+ * Invariant-enforcing helper for pickup slot capacity release (Step 8 Hardening).
+ *
+ * Strict Invariants:
+ * 1. Read pickup slot document inside the same Firestore transaction as the order transition.
+ * 2. reservedCount must exist and be an integer.
+ * 3. capacity must exist and be a non-negative integer.
+ * 4. Invariant range: reservedCount >= 1 && reservedCount <= capacity.
+ * 5. If reservedCount < 1 or any invariant fails, abort transaction with safe error:
+ *    "failed-precondition: Pickup slot capacity state is inconsistent."
+ * 6. Never silently clamp or convert invalid data to zero.
+ * 7. Transaction abort ensures no writes occur to order, slot, or status history.
+ * 8. If valid, decrement exactly once: newReservedCount = reservedCount - 1 (validated >= 0).
+ */
+function validateAndComputeSlotCapacityRelease(
+  canteenId: string,
+  slotId: string,
+  slotSnap: FirebaseFirestore.DocumentSnapshot,
+): { newReservedCount: number } {
+  if (!slotSnap.exists) {
+    console.warn(`[CapacityRelease] Slot doc not found: canteen=${canteenId}, slot=${slotId}`);
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Pickup slot capacity state is inconsistent.',
+    );
+  }
+
+  const slotData = slotSnap.data();
+  const reservedCount = slotData?.reservedCount;
+  const capacity = slotData?.capacity;
+
+  if (
+    typeof reservedCount !== 'number' ||
+    !Number.isInteger(reservedCount) ||
+    typeof capacity !== 'number' ||
+    !Number.isInteger(capacity) ||
+    capacity < 0
+  ) {
+    console.warn(
+      `[CapacityRelease] Malformed capacity fields: reservedCount=${reservedCount}, capacity=${capacity} (canteen=${canteenId}, slot=${slotId})`,
+    );
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Pickup slot capacity state is inconsistent.',
+    );
+  }
+
+  if (reservedCount < 1 || reservedCount > capacity) {
+    console.warn(
+      `[CapacityRelease] Invariant failed: reservedCount=${reservedCount}, capacity=${capacity} (canteen=${canteenId}, slot=${slotId})`,
+    );
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Pickup slot capacity state is inconsistent.',
+    );
+  }
+
+  const newReservedCount = reservedCount - 1;
+  if (newReservedCount < 0) {
+    console.warn(
+      `[CapacityRelease] Calculation underflow: newReservedCount=${newReservedCount} (canteen=${canteenId}, slot=${slotId})`,
+    );
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Pickup slot capacity state is inconsistent.',
+    );
+  }
+
+  return { newReservedCount };
+}
+
+/**
+ * Callable Function: transitionOrderStatus (Step 8)
+ *
+ * Enforces the strict server-side state machine for GrabNGo orders:
+ * - Student Cancellation: Allowed strictly for own order while status == 'placed',
+ *   paymentStatus == 'pending', and before the pickup slot begins.
+ * - Admin Transitions: Active assigned canteen admin can transition:
+ *   - placed -> accepted (cash orders only)
+ *   - payment_verified -> accepted (online payment orders)
+ *   - accepted -> preparing
+ *   - preparing -> ready_for_pickup
+ *   - ready_for_pickup -> completed
+ *   - any active non-terminal state -> cancelled or rejected (with bounded reason)
+ * - Capacity Release: Cancellation/rejection before pickup decrements slot reservedCount
+ *   transactionally, ensuring reservedCount never drops below 0.
+ * - Terminal-State Protection: completed, cancelled, and rejected orders cannot be modified.
+ * - Separation of Concerns: Payment status is never modified by this function.
+ * - Idempotency: Repeating the exact same transition returns an idempotent success response
+ *   without creating duplicate history records.
+ */
+export const transitionOrderStatus = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    // 1. Authentication
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required to transition order status.',
+      );
+    }
+    const callerUid = context.auth.uid;
+
+    // 2. Reject unknown & client-injected authoritative fields
+    rejectUnknownFields(data, ['orderId', 'nextStatus', 'reason'], 'transitionOrderStatus');
+
+    const orderId = validateId(data.orderId, 'orderId');
+    if (
+      typeof data.nextStatus !== 'string' ||
+      !VALID_ORDER_STATUSES.includes(data.nextStatus as OrderStatus)
+    ) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        `Invalid nextStatus: ${data.nextStatus}. Must be one of: ${VALID_ORDER_STATUSES.join(', ')}.`,
+      );
+    }
+    const nextStatus = data.nextStatus as OrderStatus;
+
+    let reason: string | undefined = undefined;
+    if (data.reason !== undefined && data.reason !== null) {
+      if (typeof data.reason !== 'string' || data.reason.trim().length === 0 || data.reason.trim().length > 200) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'reason must be a string between 1 and 200 characters.',
+        );
+      }
+      reason = data.reason.trim();
+    }
+
+    const orderRef = db.collection('orders').doc(orderId);
+
+    return await db.runTransaction(async (transaction) => {
+      // READ 1: Order Document
+      const orderSnap = await transaction.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new functions.https.HttpsError('not-found', `Order ${orderId} not found.`);
+      }
+      const orderData = orderSnap.data()!;
+      const currentStatus = orderData.status as OrderStatus;
+      const currentPaymentStatus = orderData.paymentStatus as PaymentStatus;
+      const paymentMethod = orderData.paymentMethod;
+
+      // Idempotent retry check: If order already has nextStatus, return cleanly without duplicating history
+      if (currentStatus === nextStatus) {
+        return {
+          success: true,
+          isIdempotent: true,
+          orderId,
+          status: nextStatus,
+          paymentStatus: currentPaymentStatus,
+        };
+      }
+
+      // Terminal State Protection: Once completed, cancelled, or rejected, no further transitions are allowed
+      if (['completed', 'cancelled', 'rejected'].includes(currentStatus)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Order ${orderId} is in terminal state '${currentStatus}' and cannot be modified.`,
+        );
+      }
+
+      // READ 2: Caller Admin Profile (if not student owner)
+      const isStudentOwner = orderData.studentUid === callerUid;
+      let isAdmin = false;
+      let actorRole: 'student' | 'canteen_admin' = 'student';
+
+      const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
+      if (adminSnap.exists && adminSnap.data()?.status === 'active') {
+        const adminData = adminSnap.data()!;
+        if (
+          adminData.role === 'platform_operator' ||
+          adminData.isOperator === true ||
+          (Array.isArray(adminData.canteenIds) && adminData.canteenIds.includes(orderData.canteenId))
+        ) {
+          isAdmin = true;
+          actorRole = 'canteen_admin';
+        }
+      }
+
+      // Authorization & State Machine Enforcement
+      if (isStudentOwner && !isAdmin) {
+        // --- STUDENT CANCELLATION RULES ---
+        if (nextStatus !== 'cancelled') {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'Students are only authorized to cancel their own orders.',
+          );
+        }
+
+        // Rule: Only while status == 'placed'
+        if (currentStatus !== 'placed') {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Students can only cancel orders in 'placed' status. Current status is '${currentStatus}'.`,
+          );
+        }
+
+        // Rule: Only while paymentStatus == 'pending'
+        if (currentPaymentStatus !== 'pending') {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'Orders with verified or completed payment cannot be self-cancelled by students.',
+          );
+        }
+
+        // Rule: Only before the pickup slot begins
+        const kolkataTime = getKolkataTime();
+        const slotDate = orderData.pickupSlot?.pickupDate;
+        const slotStartTime = orderData.pickupSlot?.pickupStartTime;
+        if (slotDate && slotStartTime) {
+          const slotStartMinutes = parseTimeToMinutes(slotStartTime);
+          const isPastOrBegun =
+            slotDate < kolkataTime.dateStr ||
+            (slotDate === kolkataTime.dateStr && slotStartMinutes <= kolkataTime.totalMinutes);
+
+          if (isPastOrBegun) {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              'Cannot cancel order after the pickup slot has already begun or passed.',
+            );
+          }
+        }
+      } else if (isAdmin) {
+        // --- ADMIN TRANSITION RULES ---
+        let allowedNext: OrderStatus[] = [];
+
+        if (currentStatus === 'placed') {
+          if (paymentMethod === 'cash') {
+            // Cash orders skip payment_verified and can be directly accepted by admin
+            allowedNext = ['accepted', 'cancelled', 'rejected'];
+          } else {
+            // Online orders must have payment verified before admin can accept
+            allowedNext = ['cancelled', 'rejected'];
+          }
+        } else if (currentStatus === 'payment_verified') {
+          allowedNext = ['accepted', 'cancelled', 'rejected'];
+        } else if (currentStatus === 'accepted') {
+          allowedNext = ['preparing', 'cancelled', 'rejected'];
+        } else if (currentStatus === 'preparing') {
+          allowedNext = ['ready_for_pickup', 'cancelled', 'rejected'];
+        } else if (currentStatus === 'ready_for_pickup') {
+          allowedNext = ['completed', 'cancelled', 'rejected'];
+        }
+
+        if (!allowedNext.includes(nextStatus)) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Invalid status transition from '${currentStatus}' to '${nextStatus}' for order with paymentMethod '${paymentMethod}'.`,
+          );
+        }
+
+        // Rule: Cancellation or completion after pickup slot has ended
+        // Rejection / cancellation requires a reason from admin
+        if ((nextStatus === 'cancelled' || nextStatus === 'rejected') && !reason) {
+          reason = `Order ${nextStatus} by canteen administrator.`;
+        }
+      } else {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          `Caller is not authorized to transition status for order ${orderId} in canteen ${orderData.canteenId}.`,
+        );
+      }
+
+      // READ 3 & INVARIANT VALIDATION: Pickup Slot for Capacity Release (on cancellation / rejection)
+      const isCancellationOrRejection = nextStatus === 'cancelled' || nextStatus === 'rejected';
+      const slotId = orderData.pickupSlotId || orderData.pickupSlot?.slotId;
+      let slotRef: FirebaseFirestore.DocumentReference | null = null;
+      let validatedNewReservedCount: number | null = null;
+
+      if (isCancellationOrRejection && slotId && typeof slotId === 'string' && slotId.trim().length > 0) {
+        slotRef = db
+          .collection('canteens')
+          .doc(orderData.canteenId)
+          .collection('pickupSlots')
+          .doc(slotId);
+        const slotSnap = await transaction.get(slotRef);
+        const releaseResult = validateAndComputeSlotCapacityRelease(
+          orderData.canteenId,
+          slotId,
+          slotSnap,
+        );
+        validatedNewReservedCount = releaseResult.newReservedCount;
+      }
+
+      // ======================================================================
+      // ALL READS & INVARIANT VALIDATIONS COMPLETE -> PERFORM ATOMIC WRITES
+      // ======================================================================
+
+      // Write 1: Update order status (strictly preserving paymentStatus, pricing, items)
+      transaction.update(orderRef, {
+        status: nextStatus,
+        updatedAt: serverTimestamp(),
+      });
+
+      // Write 2: Decrement slot capacity reservedCount (exactly once, validated newReservedCount >= 0)
+      if (slotRef && validatedNewReservedCount !== null) {
+        transaction.update(slotRef, {
+          reservedCount: validatedNewReservedCount,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      // Write 3: Append deterministic immutable status history entry
+      const eventId = `${orderId}_${currentStatus}_to_${nextStatus}`;
+      const historyRef = orderRef.collection('statusHistory').doc(eventId);
+      transaction.set(historyRef, {
+        eventId,
+        orderId,
+        fromStatus: currentStatus,
+        toStatus: nextStatus,
+        actorUid: callerUid,
+        actorRole,
+        canteenId: orderData.canteenId,
+        reason: reason || (isStudentOwner ? 'Cancelled by student' : `Status updated to ${nextStatus}`),
+        createdAt: serverTimestamp(),
+      });
+
+      return {
+        success: true,
+        isIdempotent: false,
+        orderId,
+        fromStatus: currentStatus,
+        status: nextStatus,
+        paymentStatus: currentPaymentStatus,
+      };
+    });
+  },
+);
+
+/**
+ * Callable Function: verifyDemoPayment (Step 8 — Emulator-Only Demo Behavior)
+ *
+ * Simulates verified online payment for UPI demo checkout strictly within the local emulator.
+ * RESTRICTED: Will fail with failed-precondition if FUNCTIONS_EMULATOR !== 'true'.
+ * Does not use, accept, or process real payment credentials.
+ */
+export const verifyDemoPayment = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    // 1. Emulator Guard
+    if (process.env.FUNCTIONS_EMULATOR !== 'true') {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'verifyDemoPayment is an emulator-only testing helper and is disabled in cloud environments.',
+      );
+    }
+
+    // 2. Authentication
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required to verify demo payment.',
+      );
+    }
+    const callerUid = context.auth.uid;
+
+    rejectUnknownFields(data, ['orderId'], 'verifyDemoPayment');
+    const orderId = validateId(data.orderId, 'orderId');
+    const orderRef = db.collection('orders').doc(orderId);
+
+    return await db.runTransaction(async (transaction) => {
+      const orderSnap = await transaction.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new functions.https.HttpsError('not-found', `Order ${orderId} not found.`);
+      }
+      const orderData = orderSnap.data()!;
+
+      // Ownership check: Student owner or assigned admin
+      if (orderData.studentUid !== callerUid) {
+        const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
+        const isAdmin =
+          adminSnap.exists &&
+          adminSnap.data()?.status === 'active' &&
+          (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
+            adminSnap.data()?.role === 'platform_operator');
+        if (!isAdmin) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'Only the order owner or assigned admin can verify demo payment.',
+          );
+        }
+      }
+
+      // Preconditions
+      if (orderData.paymentMethod !== 'upi_demo') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Cannot verify demo online payment for order with paymentMethod '${orderData.paymentMethod}'.`,
+        );
+      }
+      if (orderData.status !== 'placed') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Order ${orderId} is in status '${orderData.status}'. Demo payment verification requires status == 'placed'.`,
+        );
+      }
+      if (orderData.paymentStatus !== 'pending') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Order ${orderId} paymentStatus is already '${orderData.paymentStatus}'.`,
+        );
+      }
+
+      // Write 1: Update paymentStatus and order status
+      transaction.update(orderRef, {
+        paymentStatus: 'demo_verified',
+        status: 'payment_verified',
+        updatedAt: serverTimestamp(),
+      });
+
+      // Write 2: Add deterministic history entry
+      const eventId = `${orderId}_placed_to_payment_verified`;
+      const historyRef = orderRef.collection('statusHistory').doc(eventId);
+      transaction.set(historyRef, {
+        eventId,
+        orderId,
+        fromStatus: 'placed',
+        toStatus: 'payment_verified',
+        actorUid: callerUid,
+        actorRole: 'demo_payment_gateway',
+        canteenId: orderData.canteenId,
+        reason: 'Demo UPI payment verified locally in emulator',
+        createdAt: serverTimestamp(),
+      });
+
+      return {
+        success: true,
+        orderId,
+        status: 'payment_verified',
+        paymentStatus: 'demo_verified',
+      };
+    });
+  },
+);
+
+/**
+ * Callable Function: getAdminOrderQueue (Step 8)
+ *
+ * Fetches order queue for an assigned canteen with server-side authorization,
+ * status filtering, bounded pagination (max 50 records), and masked customer identifiers.
+ */
+export const getAdminOrderQueue = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    rejectUnknownFields(
+      data,
+      ['canteenId', 'status', 'limit', 'startAfterOrderId'],
+      'getAdminOrderQueue',
+    );
+
+    const canteenId = validateId(data.canteenId, 'canteenId');
+    await verifyAdminForCanteen(context, canteenId);
+
+    const limitCount =
+      typeof data.limit === 'number' && Number.isInteger(data.limit) && data.limit > 0 && data.limit <= 50
+        ? data.limit
+        : 20;
+
+    let query: FirebaseFirestore.Query = db
+      .collection('orders')
+      .where('canteenId', '==', canteenId);
+
+    if (data.status) {
+      if (!VALID_ORDER_STATUSES.includes(data.status)) {
+        throw new functions.https.HttpsError('invalid-argument', `Invalid filter status: ${data.status}.`);
+      }
+      query = query.where('status', '==', data.status);
+    }
+
+    query = query.orderBy('createdAt', 'desc').limit(limitCount);
+
+    if (data.startAfterOrderId) {
+      const cursorDoc = await db.collection('orders').doc(data.startAfterOrderId).get();
+      if (cursorDoc.exists) {
+        query = query.startAfter(cursorDoc);
+      }
+    }
+
+    const snapshot = await query.get();
+
+    const orders = snapshot.docs.map((doc) => {
+      const d = doc.data();
+      // Mask customer UID to protect student privacy: e.g. "student_...a1b2"
+      const rawUid = typeof d.studentUid === 'string' ? d.studentUid : '';
+      const maskedCustomer = rawUid ? `student_...${rawUid.slice(-4)}` : 'anonymous_student';
+
+      return {
+        orderId: d.orderId || doc.id,
+        referenceId: d.orderId || doc.id,
+        canteenId: d.canteenId,
+        status: d.status,
+        paymentStatus: d.paymentStatus,
+        paymentMethod: d.paymentMethod,
+        totalInPaise: d.totalInPaise,
+        pickupSlot: d.pickupSlot,
+        itemsSnapshot: d.itemsSnapshot,
+        maskedCustomer,
+        createdAt: d.createdAt,
+        updatedAt: d.updatedAt,
+      };
+    });
+
+    return {
+      success: true,
+      canteenId,
+      count: orders.length,
+      orders,
+    };
+  },
+);
+
+/**
+ * Callable Function: searchAdminOrder (Step 8)
+ *
+ * Performs exact-match order lookup for canteen staff.
+ * Enforces canteen isolation: will return NOT_FOUND if order belongs to another canteen,
+ * preventing cross-canteen order probing. Exposes masked customer identifier.
+ */
+export const searchAdminOrder = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    rejectUnknownFields(data, ['canteenId', 'queryOrderId'], 'searchAdminOrder');
+
+    const canteenId = validateId(data.canteenId, 'canteenId');
+    const queryOrderId = validateId(data.queryOrderId, 'queryOrderId');
+    await verifyAdminForCanteen(context, canteenId);
+
+    const docSnap = await db.collection('orders').doc(queryOrderId).get();
+    if (!docSnap.exists || docSnap.data()?.canteenId !== canteenId) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        `Order ${queryOrderId} not found in canteen ${canteenId}.`,
+      );
+    }
+
+    const d = docSnap.data()!;
+    const rawUid = typeof d.studentUid === 'string' ? d.studentUid : '';
+    const maskedCustomer = rawUid ? `student_...${rawUid.slice(-4)}` : 'anonymous_student';
+
+    return {
+      success: true,
+      order: {
+        orderId: d.orderId || docSnap.id,
+        referenceId: d.orderId || docSnap.id,
+        canteenId: d.canteenId,
+        status: d.status,
+        paymentStatus: d.paymentStatus,
+        paymentMethod: d.paymentMethod,
+        totalInPaise: d.totalInPaise,
+        pickupSlot: d.pickupSlot,
+        itemsSnapshot: d.itemsSnapshot,
+        maskedCustomer,
+        createdAt: d.createdAt,
+        updatedAt: d.updatedAt,
+      },
+    };
+  },
+);

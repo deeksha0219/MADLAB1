@@ -182,15 +182,16 @@ async function seedFixtures() {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  // Today in Asia/Kolkata
+  // Tomorrow in Asia/Kolkata to ensure slot never expires regardless of time of day
   const utcNow = new Date();
   const kolkataDate = new Date(utcNow.getTime() + (utcNow.getTimezoneOffset() + 330) * 60000);
-  const year = kolkataDate.getFullYear();
-  const month = String(kolkataDate.getMonth() + 1).padStart(2, '0');
-  const day = String(kolkataDate.getDate()).padStart(2, '0');
+  const tomorrowDate = new Date(kolkataDate.getTime() + 24 * 60 * 60 * 1000);
+  const year = tomorrowDate.getFullYear();
+  const month = String(tomorrowDate.getMonth() + 1).padStart(2, '0');
+  const day = String(tomorrowDate.getDate()).padStart(2, '0');
   const todayStr = `${year}-${month}-${day}`;
 
-  // Seed Future Pickup Slot for Today (17:00 - 17:30 IST)
+  // Seed Future Pickup Slot (17:00 - 17:30 IST)
   const slotRef = canteenRef.collection('pickupSlots').doc('SLOT_VALID_TODAY');
   await slotRef.set({
     slotId: 'SLOT_VALID_TODAY',

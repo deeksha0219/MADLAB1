@@ -1,97 +1,170 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# GrabNGo Mobile Application
 
-# Getting Started
+GrabNGo is a mobile ordering application built with React Native, TypeScript, and Firebase.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+---
 
-## Step 1: Start Metro
+## 1. Environment & Architecture Overview
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+The approved architecture consists of:
+- **Mobile Client**: React Native + TypeScript
+- **Authentication**: Firebase Authentication
+- **Database**: Cloud Firestore
+- **Backend Operations**: Firebase Cloud Functions (trusted serverless backend)
+- **Security**: Firebase Security Rules
+- **Local Dev & Testing**: Firebase Emulator Suite
+- **Messaging**: Firebase Cloud Messaging (planned)
+- **Payment**: Mock / Demo payment initially
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+### Environments:
+| Environment | Backend Target | Emulator Used | Description |
+|---|---|---|---|
+| **Local** (default) | Firebase Emulator Suite | YES (Ports 9099, 8080, 5001) | Safe offline development, demo project `demo-grabngo-local` |
+| **Staging** | `mad-lab-a9665` | NO | Approved staging cloud environment |
+| **Production** | *Not configured* | NO | Explicitly rejected; fails closed |
 
-```sh
-# Using npm
+---
+
+## 2. Prerequisites & Tooling Versions
+
+Ensure the following tools are installed on your workstation:
+- **Node.js**: `>= 22.11.0` (Active LTS recommended, tested on Node 23.x / 22.x)
+- **npm**: `>= 10.x`
+- **Java Development Kit (JDK)**: JDK 17 or JDK 21+ (required for Android builds and Firebase Emulator Suite)
+- **Android Studio & SDK**: Android SDK Platform 34+, Android SDK Build-Tools, Command-line Tools (`adb`)
+- **Firebase CLI**: `npm install -g firebase-tools` (version 13+)
+
+---
+
+## 3. Repository Setup & Branching Strategy
+
+### Branching Rules
+- **`main`**: Protected branch. Production-ready code only. Never commit directly to `main`.
+- **`development`**: Active integration branch. All feature branches and step implementations branch off and merge into `development`.
+
+### Installation
+```bash
+# Clone the repository
+git clone https://github.com/deeksha0219/MADLAB1.git
+cd MADLAB1
+
+# Switch to development branch
+git checkout development
+
+# Install exact dependencies from lockfile
+npm ci
+```
+
+---
+
+## 4. Local Firebase Emulator Suite
+
+Local development uses the Firebase Emulator Suite so you can build and test without affecting staging or production data.
+
+### Emulator Ports
+- **Authentication**: `9099`
+- **Firestore**: `8080`
+- **Cloud Functions**: `5001` (Scaffolded for CLI/backend tests; mobile client does not invoke in Step 3)
+- **Emulator UI**: `4000` (`http://localhost:4000`)
+
+### Starting Emulators
+```bash
+# Start Auth, Firestore, and Functions emulators
+firebase emulators:start --only auth,firestore,functions
+```
+
+### Stopping Emulators
+Press `Ctrl + C` in the terminal running the emulators.
+
+### Safety Rules for Emulators
+1. Emulator data is strictly disposable test data.
+2. **Never import production data** into the local emulator.
+3. No real credentials or live payment details should ever be used.
+
+---
+
+## 5. Environment Configuration & Verification
+
+React Native does not automatically load `.env` files into JS runtime without extra native modules. Environment configuration is centrally managed via:
+`src/config/environment.ts`
+
+### Safe Environment Templates
+The repository provides safe configuration templates:
+- `.env.example`: General template and variable definitions
+- `.env.local.example`: Pre-configured for local emulator development (`demo-grabngo-local`)
+- `.env.staging.example`: Pre-configured for staging cloud project (`mad-lab-a9665`)
+
+> [!CAUTION]
+> **Secret Handling Rule**:
+> NEVER commit `.env`, `.env.*`, service account JSON keys, or `.pem` private keys to version control. The `.gitignore` file enforces this rule.
+
+### Verifying the Active Environment
+When the application starts, it executes `configureFirebase()` from `src/config/firebase.ts`, logging an active environment banner:
+```
+====================================================
+[GrabNGo Environment] Active: LOCAL
+[GrabNGo Environment] Firebase Project ID: demo-grabngo-local
+[GrabNGo Environment] Uses Emulator: true
+[GrabNGo Environment] Mobile Client Calls Functions Emulator: false
+[GrabNGo Environment] Emulator Host: 10.0.2.2 (Auth:9099, Firestore:8080)
+====================================================
+```
+If an unauthorized or unknown environment is passed, or if `'production'` is attempted, the app immediately throws a fatal exception and halts execution.
+
+---
+
+## 6. Available Quality & Validation Scripts
+
+| Command | Purpose |
+|---|---|
+| `npm run typecheck` | Runs `tsc --noEmit` to verify strict TypeScript types without emitting artifacts. |
+| `npm run lint` | Runs `eslint .` to check for style and lint violations. |
+| `npm test` | Runs Jest unit and environment test suites. |
+| `npm run test:watch` | Runs Jest in interactive watch mode. |
+| `npm run test:emulator` | Runs emulator-specific test suites (`__tests__/emulator`). |
+
+---
+
+## 7. Running the Mobile Application
+
+### Step 1: Start Metro Bundler
+```bash
 npm start
-
-# OR using Yarn
-yarn start
 ```
 
-## Step 2: Build and run your app
-
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
-
-```sh
-# Using npm
+### Step 2: Run on Android
+```bash
 npm run android
-
-# OR using Yarn
-yarn android
 ```
 
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
-```sh
-bundle install
-```
-
-Then, and every time you update your native dependencies, run:
-
-```sh
-bundle exec pod install
-```
-
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
+### Step 3: Run on iOS (macOS only)
+```bash
+cd ios && bundle exec pod install && cd ..
 npm run ios
-
-# OR using Yarn
-yarn ios
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+---
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+## 8. Staging Deployment Policy & Approvals
 
-## Step 3: Modify your app
+> [!WARNING]
+> **STAGING DEPLOYMENT PROHIBITED IN STEP 3**:
+> 1. `firestore.rules` in this step is a local deny-by-default emulator placeholder. Deploying it to staging will break the application.
+> 2. Cloud Functions in this step is a scaffold placeholder without business operations.
+> 3. Deployment of Security Rules or Cloud Functions to staging requires:
+>    - Full implementation of authentication-aware rules in Step 4+.
+>    - Comprehensive allow and deny unit tests passing against the emulator.
+>    - Explicit user review and written approval.
+> 4. To protect staging, `.firebaserc` sets `default` to `demo-grabngo-local`. Default CLI commands cannot target staging unless `-P staging` is explicitly provided.
 
-Now that you have successfully run the app, let's make changes!
+---
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+## 9. Intentionally Not Implemented in Step 3
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+The following components are deliberately out of scope for Step 3:
+- Student authentication and registration flows (Step 4)
+- Admin and staff role management
+- Production Cloud Firestore security rules
+- Shopping cart migration and order placement logic
+- Cloud Functions payment and notification triggers
+- Cloud Messaging (FCM) integration

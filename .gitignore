@@ -73,3 +73,20 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Environment files and secrets (Never commit secrets)
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*serviceAccount*.json
+*-adminsdk-*.json
+
+# Firebase Emulator artifacts and logs
+.firebase/
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+pubsub-debug.log*
+database-debug.log*

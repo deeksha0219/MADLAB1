@@ -1,0 +1,100 @@
+name: GrabNGo CI
+
+on:
+  push:
+    branches:
+      - development
+      - main
+  pull_request:
+    branches:
+      - development
+      - main
+
+jobs:
+  validate:
+    name: Foundation & Environment Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Verify No Secrets Committed (Recursive Scan)
+        run: |
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+
+            const IGNORED_DIRS = new Set(['node_modules', '.git', 'Pods', '.gradle', 'build']);
+            const forbiddenFiles = [];
+
+            function scan(dir) {
+              const entries = fs.readdirSync(dir, { withFileTypes: true });
+              for (const entry of entries) {
+                if (entry.isDirectory()) {
+                  if (!IGNORED_DIRS.has(entry.name)) {
+                    scan(path.join(dir, entry.name));
+                  }
+                } else if (entry.isFile()) {
+                  const name = entry.name;
+                  // Secret file checks
+                  const isEnvSecret = /^\.env(\.|$)/i.test(name) && !name.endsWith('.example');
+                  const isServiceAccount = /serviceAccount.*\.json$/i.test(name);
+                  const isAdminSdk = /.*-adminsdk-.*\.json$/i.test(name);
+                  const isCert = /\.(pem|key)$/i.test(name);
+
+                  if (isEnvSecret || isServiceAccount || isAdminSdk || isCert) {
+                    forbiddenFiles.push(path.join(dir, name));
+                  }
+                }
+              }
+            }
+
+            scan('.');
+
+            if (forbiddenFiles.length > 0) {
+              console.error('::error::Forbidden sensitive files detected in repository:');
+              forbiddenFiles.forEach(f => console.error('  - ' + f));
+              process.exit(1);
+            }
+
+            console.log('Secret scan passed: zero sensitive files detected.');
+          "
+
+      - name: Install Dependencies (Exact via lockfile)
+        run: npm ci
+
+      - name: TypeScript Typecheck (No-Emit)
+        run: npm run typecheck
+
+      - name: ESLint Check
+        run: npm run lint
+
+      - name: Jest Test Suite
+        run: npm test -- --runInBand
+
+      - name: Validate Firebase Configuration
+        run: |
+          node -e "
+            const fs = require('fs');
+            const rc = JSON.parse(fs.readFileSync('.firebaserc', 'utf8'));
+            if (rc.projects.default !== 'demo-grabngo-local') {
+              console.error('Default alias must be demo-grabngo-local to prevent accidental deploy');
+              process.exit(1);
+            }
+            if (rc.projects.staging !== 'mad-lab-a9665') {
+              console.error('Staging alias must be mad-lab-a9665');
+              process.exit(1);
+            }
+            if (rc.projects.production) {
+              console.error('Production alias must NOT be configured in Step 3');
+              process.exit(1);
+            }
+            console.log('Firebase project aliases verified: default -> demo-grabngo-local, staging -> mad-lab-a9665.');
+          "

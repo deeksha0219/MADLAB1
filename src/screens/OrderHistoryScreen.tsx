@@ -66,8 +66,19 @@ interface OrderItem {
 
 interface Order {
   id: string;
-  orderId?: string;
-  referenceId?: string;
+  orderId: string;
+  referenceId: string;
+  canteenId: string;
+  status: string;
+  paymentStatus: string;
+  paymentMethod: string;
+  pickupSlot?: {
+    slotId: string;
+    pickupDate: string;
+    pickupStartTime: string;
+    pickupEndTime: string;
+    timezone: string;
+  };
   items: OrderItem[];
   total: number;
   placedAt: any;
@@ -84,10 +95,35 @@ const formatDate = (val: any): string => {
 };
 
 import auth from "@react-native-firebase/auth";
+import { Alert } from "react-native";
+import { setUserCartItem, transitionOrderStatusCallable } from "../services/orderService";
+
+const getStatusColor = (status: string) => {
+  switch (status) {
+    case "placed":
+      return { bg: "#FEF3C7", text: "#92400E" }; // Amber
+    case "payment_verified":
+      return { bg: "#DBEAFE", text: "#1E40AF" }; // Blue
+    case "accepted":
+      return { bg: "#E0E7FF", text: "#3730A3" }; // Indigo
+    case "preparing":
+      return { bg: "#FED7AA", text: "#9A3412" }; // Orange
+    case "ready_for_pickup":
+      return { bg: "#D1FAE5", text: "#065F46" }; // Emerald
+    case "completed":
+      return { bg: "#E2E8F0", text: "#334155" }; // Slate
+    case "cancelled":
+    case "rejected":
+      return { bg: "#FEE2E2", text: "#991B1B" }; // Red
+    default:
+      return { bg: "#F3F4F6", text: "#374151" };
+  }
+};
 
 export default function OrderHistoryScreen() {
   const navigation = useNavigation<any>();
   const [orders, setOrders] = useState<Order[]>([]);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
   const currentUid = auth().currentUser?.uid;
 
   useEffect(() => {
@@ -99,99 +135,185 @@ export default function OrderHistoryScreen() {
       .collection("orders")
       .where("studentUid", "==", currentUid)
       .orderBy("createdAt", "desc")
-      .onSnapshot(snap => {
-        if (!snap) return;
-        const data = snap.docs.map(doc => {
-          const d = doc.data();
-          return {
-            id: doc.id,
-            orderId: d.orderId || doc.id,
-            referenceId: d.orderId || doc.id,
-            items: (d.itemsSnapshot || []).map((item: any) => ({
-              id: item.itemId,
-              name: item.itemName,
-              price: Math.floor((item.unitPriceInPaise || 0) / 100),
-              quantity: item.quantity,
-            })),
-            total: Math.floor((d.totalInPaise || 0) / 100),
-            placedAt: d.createdAt,
-          };
-        }) as Order[];
+      .onSnapshot(
+        (snap) => {
+          if (!snap) return;
+          const data = snap.docs.map((doc) => {
+            const d = doc.data();
+            return {
+              id: doc.id,
+              orderId: d.orderId || doc.id,
+              referenceId: d.orderId || doc.id,
+              canteenId: d.canteenId || "",
+              status: d.status || "placed",
+              paymentStatus: d.paymentStatus || "pending",
+              paymentMethod: d.paymentMethod || "cash",
+              pickupSlot: d.pickupSlot,
+              items: (d.itemsSnapshot || []).map((item: any) => ({
+                id: item.itemId,
+                name: item.itemName,
+                price: Math.floor((item.unitPriceInPaise || 0) / 100),
+                quantity: item.quantity,
+              })),
+              total: Math.floor((d.totalInPaise || 0) / 100),
+              placedAt: d.createdAt,
+            };
+          }) as Order[];
 
-        setOrders(data);
-      }, err => {
-        console.log("Order history error:", err);
-      });
+          setOrders(data);
+        },
+        (err) => {
+          console.log("Order history error:", err);
+        },
+      );
     return () => unsubscribe();
   }, [currentUid]);
 
-  const renderOrder = ({ item }: { item: Order }) => (
-    <View style={styles.orderCard}>
-      <Text style={styles.orderDate}>🕐 {formatDate(item.placedAt)}</Text>
+  const handleCancelOrder = async (orderId: string) => {
+    Alert.alert(
+      "Cancel Order",
+      "Are you sure you want to cancel this order? Your reserved pickup slot will be released.",
+      [
+        { text: "No", style: "cancel" },
+        {
+          text: "Yes, Cancel",
+          style: "destructive",
+          onPress: async () => {
+            setCancellingId(orderId);
+            try {
+              await transitionOrderStatusCallable({
+                orderId,
+                nextStatus: "cancelled",
+                reason: "Cancelled by student from order history",
+              });
+              Alert.alert("Order Cancelled", "Your order has been cancelled successfully.");
+            } catch (err: any) {
+              Alert.alert("Cancellation Failed", err.message || "Failed to cancel order.");
+            } finally {
+              setCancellingId(null);
+            }
+          },
+        },
+      ],
+    );
+  };
 
-      {/* Order ID / Reference ID */}
-      <View style={{ flexDirection: "row", justifyContent: "space-between", marginBottom: 8 }}>
-        <Text style={{ fontSize: 12, color: "gray" }}>
-          Order ID: <Text style={{ fontWeight: "bold", color: "#333" }}>{(item as any).orderId || "—"}</Text>
-        </Text>
-        <Text style={{ fontSize: 12, color: "gray" }}>
-          Ref: <Text style={{ fontWeight: "bold", color: "#333" }}>{(item as any).referenceId || "—"}</Text>
-        </Text>
-      </View>
+  const renderOrder = ({ item }: { item: Order }) => {
+    const statusTheme = getStatusColor(item.status);
+    const canCancel = item.status === "placed" && item.paymentStatus === "pending";
 
-      {item.items.map((food, index) => (
-        <View key={index} style={styles.itemRow}>
-          <Image
-            source={foodImages[food.name] || require("../../assets/snacks.png")}
-            style={styles.itemImage}
-          />
-          <View style={styles.itemDetails}>
-            <View style={styles.itemNameRow}>
-              <Text style={styles.itemName}>{food.name} ({food.quantity})</Text>
-              <Text style={styles.itemPrice}>₹{food.price * food.quantity}</Text>
-            </View>
+    return (
+      <View style={styles.orderCard}>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+          <Text style={styles.orderDate}>🕐 {formatDate(item.placedAt)}</Text>
+          <View
+            style={{
+              backgroundColor: statusTheme.bg,
+              paddingHorizontal: 10,
+              paddingVertical: 4,
+              borderRadius: 8,
+            }}
+          >
+            <Text style={{ color: statusTheme.text, fontWeight: "bold", fontSize: 11 }}>
+              {item.status.toUpperCase().replace(/_/g, " ")}
+            </Text>
           </View>
         </View>
-      ))}
-      <View style={styles.bottomRow}>
-        <Text style={styles.totalText}>Total: ₹{item.total}</Text>
-        <TouchableOpacity
-          style={styles.reorderBtn}
-          onPress={async () => {
-            try {
-              const cartRef = firestore().collection("cart");
 
-              for (const food of item.items) {
-                const existing = await cartRef
-                  .where("name", "==", food.name)
-                  .get();
+        {/* Order ID / Reference ID */}
+        <View style={{ flexDirection: "row", justifyContent: "space-between", marginTop: 8, marginBottom: 8 }}>
+          <Text style={{ fontSize: 12, color: "gray" }}>
+            Order ID: <Text style={{ fontWeight: "bold", color: "#333" }}>{item.orderId || "—"}</Text>
+          </Text>
+          <Text style={{ fontSize: 12, color: "gray" }}>
+            Ref: <Text style={{ fontWeight: "bold", color: "#333" }}>{item.referenceId || "—"}</Text>
+          </Text>
+        </View>
 
-                if (!existing.empty) {
-                  const doc = existing.docs[0];
-                  await cartRef.doc(doc.id).update({
-                    quantity: doc.data().quantity + food.quantity,
-                  });
-                } else {
-                  await cartRef.add({
-                    name: food.name,
-                    price: food.price,
-                    quantity: food.quantity,
-                  });
+        {/* Pickup slot detail */}
+        {item.pickupSlot && (
+          <View
+            style={{
+              backgroundColor: "#F8FAFC",
+              padding: 8,
+              borderRadius: 6,
+              marginBottom: 10,
+              borderWidth: 1,
+              borderColor: "#E2E8F0",
+            }}
+          >
+            <Text style={{ fontSize: 12, color: "#475569" }}>
+              📍 Pickup: <Text style={{ fontWeight: "600" }}>{item.pickupSlot.pickupDate}</Text> (
+              {item.pickupSlot.pickupStartTime} - {item.pickupSlot.pickupEndTime} IST)
+            </Text>
+          </View>
+        )}
+
+        {item.items.map((food, index) => (
+          <View key={index} style={styles.itemRow}>
+            <Image
+              source={foodImages[food.name] || require("../../assets/snacks.png")}
+              style={styles.itemImage}
+            />
+            <View style={styles.itemDetails}>
+              <View style={styles.itemNameRow}>
+                <Text style={styles.itemName}>
+                  {food.name} ({food.quantity})
+                </Text>
+                <Text style={styles.itemPrice}>₹{food.price * food.quantity}</Text>
+              </View>
+            </View>
+          </View>
+        ))}
+
+        <View style={styles.bottomRow}>
+          <Text style={styles.totalText}>Total: ₹{item.total}</Text>
+          <View style={{ flexDirection: "row", gap: 10 }}>
+            {canCancel && (
+              <TouchableOpacity
+                style={{
+                  backgroundColor: "#FEE2E2",
+                  paddingHorizontal: 12,
+                  paddingVertical: 6,
+                  borderRadius: 8,
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+                disabled={cancellingId === item.orderId}
+                onPress={() => handleCancelOrder(item.orderId)}
+              >
+                <Text style={{ color: "#DC2626", fontWeight: "bold", fontSize: 12 }}>
+                  {cancellingId === item.orderId ? "Cancelling..." : "Cancel"}
+                </Text>
+              </TouchableOpacity>
+            )}
+
+            <TouchableOpacity
+              style={styles.reorderBtn}
+              onPress={async () => {
+                if (!currentUid) return;
+                try {
+                  for (const food of item.items) {
+                    await setUserCartItem(currentUid, {
+                      itemId: food.id,
+                      canteenId: item.canteenId || "CANTEEN_TEST_7",
+                      quantity: food.quantity,
+                    });
+                  }
+                  navigation.navigate("Cart");
+                } catch (err: any) {
+                  Alert.alert("Reorder Failed", err.message || "Failed to add items to cart.");
                 }
-              }
-
-              navigation.navigate("Cart");
-            } catch (err) {
-              console.log(err);
-            }
-          }}
-        >
-          <Text style={styles.reorderIcon}>↻</Text>
-          <Text style={styles.reorderText}>Reorder</Text>
-        </TouchableOpacity>
+              }}
+            >
+              <Text style={styles.reorderIcon}>↻</Text>
+              <Text style={styles.reorderText}>Reorder</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
       </View>
-    </View>
-  );
+    );
+  };
 
   return (
     <SafeAreaView style={styles.container}>
@@ -206,9 +328,7 @@ export default function OrderHistoryScreen() {
         keyExtractor={(item) => item.id}
         renderItem={renderOrder}
         contentContainerStyle={{ padding: 15 }}
-        ListEmptyComponent={
-          <Text style={styles.emptyText}>No orders yet! 🍽️</Text>
-        }
+        ListEmptyComponent={<Text style={styles.emptyText}>No orders yet! 🍽️</Text>}
       />
     </SafeAreaView>
   );

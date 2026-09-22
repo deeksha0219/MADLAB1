@@ -159,8 +159,24 @@ service cloud.firestore {
       );
 
       // All order creation, updates, and deletes are strictly prohibited from client devices
-      // Order creation is brokered exclusively via the 'createOrder' Cloud Function
+      // Order creation & status transitions are brokered exclusively via Cloud Functions
       allow write: if false;
+
+      // ----------------------------------------------------------------------
+      // Status History Subcollection (Step 8)
+      // orders/{orderId}/statusHistory/{eventId}
+      // ----------------------------------------------------------------------
+      match /statusHistory/{eventId} {
+        // Students can read history for their own orders
+        // Assigned active admins can read history for assigned canteens
+        allow read: if isAuthenticated() && (
+          get(/databases/$(database)/documents/orders/$(orderId)).data.studentUid == request.auth.uid
+          || isCanteenAdmin(get(/databases/$(database)/documents/orders/$(orderId)).data.canteenId)
+        );
+
+        // Direct client writes are strictly denied (Cloud Functions only)
+        allow write: if false;
+      }
     }
 
     // ------------------------------------------------------------------------
