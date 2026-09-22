@@ -73,16 +73,6 @@ interface Order {
   placedAt: any;
 }
 
-const getTime = (val: any): number => {
-  if (typeof val === "number" && !isNaN(val)) return val;
-  if (typeof val?.toDate === "function") return val.toDate().getTime();
-  if (typeof val === "string") {
-    const t = new Date(val).getTime();
-    return isNaN(t) ? -1 : t;
-  }
-  return -1;
-};
-
 const formatDate = (val: any): string => {
   if (typeof val === "number" && !isNaN(val)) return new Date(val).toLocaleString();
   if (typeof val?.toDate === "function") return val.toDate().toLocaleString();
@@ -93,25 +83,47 @@ const formatDate = (val: any): string => {
   return "Old Order";
 };
 
+import auth from "@react-native-firebase/auth";
+
 export default function OrderHistoryScreen() {
   const navigation = useNavigation<any>();
   const [orders, setOrders] = useState<Order[]>([]);
+  const currentUid = auth().currentUser?.uid;
 
   useEffect(() => {
+    if (!currentUid) {
+      setOrders([]);
+      return;
+    }
     const unsubscribe = firestore()
-      .collection("orderHistory")
+      .collection("orders")
+      .where("studentUid", "==", currentUid)
+      .orderBy("createdAt", "desc")
       .onSnapshot(snap => {
-        const data = snap.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-        })) as Order[];
-
-        data.sort((a, b) => getTime(b.placedAt) - getTime(a.placedAt));
+        if (!snap) return;
+        const data = snap.docs.map(doc => {
+          const d = doc.data();
+          return {
+            id: doc.id,
+            orderId: d.orderId || doc.id,
+            referenceId: d.orderId || doc.id,
+            items: (d.itemsSnapshot || []).map((item: any) => ({
+              id: item.itemId,
+              name: item.itemName,
+              price: Math.floor((item.unitPriceInPaise || 0) / 100),
+              quantity: item.quantity,
+            })),
+            total: Math.floor((d.totalInPaise || 0) / 100),
+            placedAt: d.createdAt,
+          };
+        }) as Order[];
 
         setOrders(data);
+      }, err => {
+        console.log("Order history error:", err);
       });
     return () => unsubscribe();
-  }, []);
+  }, [currentUid]);
 
   const renderOrder = ({ item }: { item: Order }) => (
     <View style={styles.orderCard}>

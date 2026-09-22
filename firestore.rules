@@ -1,11 +1,11 @@
 rules_version = '2';
 // ============================================================================
-// GrabNGo - Cloud Firestore Security Rules (Step 4 Hardened with diff() allowlist)
+// GrabNGo - Cloud Firestore Security Rules (Step 7 Hardened)
 //
 // SAFETY WARNING:
-// DO NOT DEPLOY TO STAGING IN STEP 4.
+// DO NOT DEPLOY TO STAGING IN STEP 7.
 // This ruleset is active strictly for local Firebase Emulator Suite testing.
-// Deployment to staging requires completion of all Step 4 tests, migration safety review,
+// Deployment to staging requires completion of all Step 7 tests, migration safety review,
 // and explicit written user approval.
 // ============================================================================
 
@@ -44,6 +44,38 @@ service cloud.firestore {
 
       // Deletion is strictly prohibited from client devices
       allow delete: if false;
+
+      // ----------------------------------------------------------------------
+      // User-Scoped Cart: users/{userId}/cart/{itemKey}
+      // ----------------------------------------------------------------------
+      match /cart/{itemKey} {
+        allow read: if isOwner(userId);
+
+        allow create: if isOwner(userId)
+          && request.resource.data.keys().hasOnly(['itemId', 'canteenId', 'quantity', 'updatedAt'])
+          && request.resource.data.itemId == itemKey
+          && request.resource.data.quantity is int
+          && request.resource.data.quantity >= 1
+          && request.resource.data.quantity <= 99
+          && request.resource.data.updatedAt == request.time;
+
+        allow update: if isOwner(userId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantity', 'updatedAt'])
+          && request.resource.data.quantity is int
+          && request.resource.data.quantity >= 1
+          && request.resource.data.quantity <= 99
+          && request.resource.data.updatedAt == request.time;
+
+        allow delete: if isOwner(userId);
+      }
+
+      // ----------------------------------------------------------------------
+      // Order Requests (Idempotency Tracking): users/{userId}/orderRequests/{idempotencyKey}
+      // ----------------------------------------------------------------------
+      match /orderRequests/{idempotencyKey} {
+        allow read: if isOwner(userId);
+        allow write: if false; // Cloud Functions only
+      }
     }
 
     // ------------------------------------------------------------------------
@@ -63,6 +95,7 @@ service cloud.firestore {
     // canteens/{canteenId}/categories/{categoryId}
     // canteens/{canteenId}/items/{itemId}
     // canteens/{canteenId}/items/{itemId}/private/{docId}
+    // canteens/{canteenId}/pickupSlots/{slotId} (Step 7)
     // ------------------------------------------------------------------------
     function isCanteenAdmin(canteenId) {
       return isAuthenticated()
@@ -101,10 +134,37 @@ service cloud.firestore {
           allow write: if false;
         }
       }
+
+      // Step 7: Pickup Slots
+      match /pickupSlots/{slotId} {
+        // Authenticated users can read open slots; assigned admins can read any slot
+        allow read: if isAuthenticated() && (
+          resource.data.isOpen == true || isCanteenAdmin(canteenId)
+        );
+        // Capacity reservation and slot configuration are Cloud Functions / Admin SDK only
+        allow write: if false;
+      }
     }
 
     // ------------------------------------------------------------------------
-    // Future Protected Collections (Orders, Carts, Payments)
+    // Orders Collection (Step 7)
+    // orders/{orderId}
+    // ------------------------------------------------------------------------
+    match /orders/{orderId} {
+      // Students can read ONLY their own orders
+      // Assigned active admins can read orders for their assigned canteens
+      allow read: if isAuthenticated() && (
+        resource.data.studentUid == request.auth.uid
+        || isCanteenAdmin(resource.data.canteenId)
+      );
+
+      // All order creation, updates, and deletes are strictly prohibited from client devices
+      // Order creation is brokered exclusively via the 'createOrder' Cloud Function
+      allow write: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Future Protected Collections (Payments, FCM)
     // Remain denied until their respective steps are implemented.
     // ------------------------------------------------------------------------
     match /{document=**} {

@@ -14,6 +14,7 @@
 
 import * as functions from 'firebase-functions/v1';
 import * as admin from 'firebase-admin';
+import * as crypto from 'crypto';
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -837,6 +838,523 @@ export const setMenuItemActive = functions.https.onCall(
     });
 
     return { success: true, itemId, isActive: data.isActive };
+  },
+);
+
+/**
+ * Helper: Asia/Kolkata timezone calculations (UTC + 05:30)
+ */
+export function getKolkataTime(now = new Date()): {
+  dateStr: string;
+  timeStr: string;
+  totalMinutes: number;
+  fullDate: Date;
+} {
+  const utcMillis = now.getTime() + now.getTimezoneOffset() * 60000;
+  const kolkataMillis = utcMillis + 330 * 60000;
+  const kolkataDate = new Date(kolkataMillis);
+
+  const year = kolkataDate.getFullYear();
+  const month = String(kolkataDate.getMonth() + 1).padStart(2, '0');
+  const day = String(kolkataDate.getDate()).padStart(2, '0');
+  const dateStr = `${year}-${month}-${day}`;
+
+  const hours = kolkataDate.getHours();
+  const minutes = kolkataDate.getMinutes();
+  const timeStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+  const totalMinutes = hours * 60 + minutes;
+
+  return { dateStr, timeStr, totalMinutes, fullDate: kolkataDate };
+}
+
+export function parseTimeToMinutes(timeStr: string): number {
+  if (!/^\d{2}:\d{2}$/.test(timeStr)) {
+    throw new functions.https.HttpsError(
+      'invalid-argument',
+      `Invalid time format: ${timeStr}. Expected HH:mm.`,
+    );
+  }
+  const [h, m] = timeStr.split(':').map(Number);
+  if (h < 0 || h > 23 || m < 0 || m > 59) {
+    throw new functions.https.HttpsError(
+      'invalid-argument',
+      `Time out of bounds: ${timeStr}.`,
+    );
+  }
+  return h * 60 + m;
+}
+
+export function computeRequestHash(payload: {
+  canteenId: string;
+  items: Array<{ itemId: string; quantity: number }>;
+  pickupSlotId: string;
+  paymentMethod: string;
+}): string {
+  const sortedItems = [...payload.items].sort((a, b) => a.itemId.localeCompare(b.itemId));
+  const canonical = JSON.stringify({
+    canteenId: payload.canteenId,
+    items: sortedItems,
+    paymentMethod: payload.paymentMethod,
+    pickupSlotId: payload.pickupSlotId,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Callable Function: createPickupSlot (Admin only)
+ * Creates or configures a designated pickup slot for a canteen.
+ */
+export const createPickupSlot = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    rejectUnknownFields(
+      data,
+      ['canteenId', 'slotId', 'date', 'startTime', 'endTime', 'capacity', 'isOpen'],
+      'createPickupSlot',
+    );
+    const canteenId = validateId(data.canteenId, 'canteenId');
+    const slotId = validateId(data.slotId, 'slotId');
+    await verifyAdminForCanteen(context, canteenId);
+
+    if (typeof data.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(data.date)) {
+      throw new functions.https.HttpsError('invalid-argument', 'date must be in YYYY-MM-DD format.');
+    }
+    const startMinutes = parseTimeToMinutes(data.startTime);
+    const endMinutes = parseTimeToMinutes(data.endTime);
+    if (startMinutes >= endMinutes) {
+      throw new functions.https.HttpsError('invalid-argument', 'startTime must be before endTime.');
+    }
+    if (startMinutes < 8 * 60 || endMinutes > 19 * 60) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'Pickup slot must be within operating hours (08:00 - 19:00 IST).',
+      );
+    }
+    if (data.capacity !== undefined) {
+      if (
+        typeof data.capacity !== 'number' ||
+        !Number.isInteger(data.capacity) ||
+        data.capacity < 1 ||
+        data.capacity > 500
+      ) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'capacity must be an integer between 1 and 500.',
+        );
+      }
+    }
+    const capacity = typeof data.capacity === 'number' ? data.capacity : 30;
+    const isOpen = data.isOpen !== false;
+
+    const slotRef = db.collection('canteens').doc(canteenId).collection('pickupSlots').doc(slotId);
+    await slotRef.set({
+      slotId,
+      canteenId,
+      date: data.date,
+      startTime: data.startTime,
+      endTime: data.endTime,
+      timezone: 'Asia/Kolkata',
+      isOpen,
+      capacity,
+      reservedCount: 0,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return { success: true, slotId };
+  },
+);
+
+/**
+ * Callable Function: createOrder (Step 7)
+ *
+ * Core Security & Invariance:
+ * 1. Client sends only validated intent: canteenId, items: [{itemId, quantity}], pickupSlotId, paymentMethod, idempotencyKey.
+ * 2. Reject all client-supplied price, unitPrice, lineTotal, subtotal, total, status, or timestamps.
+ * 3. Authoritative prices are re-read from Firestore catalog inside an atomic transaction.
+ * 4. Slot capacity is checked and reserved transactionally.
+ * 5. Submitted cart items in users/{studentUid}/cart/{itemId} are cleared in the same transaction.
+ * 6. Deterministic orderId derived from studentUid and idempotencyKey.
+ * 7. ALL transaction reads execute BEFORE any transaction writes.
+ */
+export const createOrder = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    // 1. Authentication
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required to place an order.',
+      );
+    }
+    const studentUid = context.auth.uid;
+
+    // 2. Reject unknown / forbidden fields
+    rejectUnknownFields(
+      data,
+      ['canteenId', 'items', 'pickupSlotId', 'paymentMethod', 'idempotencyKey'],
+      'createOrder',
+    );
+
+    // 3. Validate canteenId
+    const canteenId = validateId(data.canteenId, 'canteenId');
+
+    // 4. Validate idempotencyKey (36-128 chars)
+    if (
+      typeof data.idempotencyKey !== 'string' ||
+      !/^[a-zA-Z0-9_-]{36,128}$/.test(data.idempotencyKey)
+    ) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'idempotencyKey must be a 36-128 character alphanumeric/hyphen/underscore string.',
+      );
+    }
+    const idempotencyKey = data.idempotencyKey;
+
+    // 5. Validate paymentMethod strictly
+    if (data.paymentMethod !== 'cash' && data.paymentMethod !== 'upi_demo') {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        "paymentMethod must be strictly 'cash' or 'upi_demo'. Live payment is deferred to Step 9.",
+      );
+    }
+    const paymentMethod: 'cash' | 'upi_demo' = data.paymentMethod;
+
+    // 6. Validate pickupSlotId
+    const pickupSlotId = validateId(data.pickupSlotId, 'pickupSlotId');
+
+    // 7. Validate items array
+    if (!Array.isArray(data.items) || data.items.length === 0) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'items must be a non-empty array.',
+      );
+    }
+    if (data.items.length > 50) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'Maximum 50 distinct items allowed per order.',
+      );
+    }
+
+    const seenItemIds = new Set<string>();
+    const sanitizedItems: Array<{ itemId: string; quantity: number }> = [];
+
+    for (const item of data.items) {
+      if (!item || typeof item !== 'object') {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'Each item in items array must be an object.',
+        );
+      }
+      rejectUnknownFields(item, ['itemId', 'quantity'], 'item');
+      const itemId = validateId(item.itemId, 'itemId');
+      if (seenItemIds.has(itemId)) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          `Duplicate item ${itemId} in items array.`,
+        );
+      }
+      seenItemIds.add(itemId);
+
+      if (
+        typeof item.quantity !== 'number' ||
+        !Number.isInteger(item.quantity) ||
+        item.quantity < 1 ||
+        item.quantity > 99
+      ) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          `Item ${itemId} quantity must be an integer between 1 and 99.`,
+        );
+      }
+      sanitizedItems.push({ itemId, quantity: item.quantity });
+    }
+
+    // Compute canonical request hash
+    const requestHash = computeRequestHash({
+      canteenId,
+      items: sanitizedItems,
+      pickupSlotId,
+      paymentMethod,
+    });
+
+    // Derive orderId securely from studentUid and idempotencyKey (32-character hash slice for collision resistance)
+    const hashPart = crypto
+      .createHash('sha256')
+      .update(`${studentUid}:${idempotencyKey}`)
+      .digest('hex')
+      .substring(0, 32)
+      .toUpperCase();
+    const orderId = `GNG-${hashPart}`;
+
+    const orderRef = db.collection('orders').doc(orderId);
+    const idempotencyRef = db
+      .collection('users')
+      .doc(studentUid)
+      .collection('orderRequests')
+      .doc(idempotencyKey);
+    const canteenRef = db.collection('canteens').doc(canteenId);
+    const slotRef = canteenRef.collection('pickupSlots').doc(pickupSlotId);
+
+    // 8. Execute Firestore Transaction: ALL READS FIRST, THEN ALL WRITES
+    const result = await db.runTransaction(async (transaction) => {
+      // --- READ 1: Idempotency Record ---
+      const existingReq = await transaction.get(idempotencyRef);
+      if (existingReq.exists) {
+        const reqData = existingReq.data()!;
+        if (reqData.requestHash === requestHash) {
+          // Idempotent retry: read existing order and return
+          const existingOrder = await transaction.get(orderRef);
+          if (existingOrder.exists) {
+            const ordData = existingOrder.data()!;
+            return {
+              isRetry: true,
+              orderId: ordData.orderId,
+              status: ordData.status,
+              paymentStatus: ordData.paymentStatus,
+              totalInPaise: ordData.totalInPaise,
+              subtotalInPaise: ordData.subtotalInPaise,
+              pickupSlot: ordData.pickupSlot,
+              itemsSnapshot: ordData.itemsSnapshot,
+            };
+          }
+        } else {
+          throw new functions.https.HttpsError(
+            'already-exists',
+            'Idempotency key reuse with differing request parameters.',
+          );
+        }
+      }
+
+      // --- READ 2: Canteen ---
+      const canteenSnap = await transaction.get(canteenRef);
+      if (!canteenSnap.exists) {
+        throw new functions.https.HttpsError('not-found', `Canteen ${canteenId} not found.`);
+      }
+      const canteenData = canteenSnap.data()!;
+      if (canteenData.isActive !== true) {
+        throw new functions.https.HttpsError('failed-precondition', `Canteen ${canteenId} is not active.`);
+      }
+
+      // --- READ 3: Pickup Slot ---
+      const slotSnap = await transaction.get(slotRef);
+      if (!slotSnap.exists) {
+        throw new functions.https.HttpsError('not-found', `Pickup slot ${pickupSlotId} not found.`);
+      }
+      const slotData = slotSnap.data()!;
+      if (slotData.isOpen !== true) {
+        throw new functions.https.HttpsError('failed-precondition', `Pickup slot ${pickupSlotId} is closed.`);
+      }
+
+      // Validate slot schema
+      if (
+        typeof slotData.date !== 'string' ||
+        typeof slotData.startTime !== 'string' ||
+        typeof slotData.endTime !== 'string' ||
+        slotData.timezone !== 'Asia/Kolkata' ||
+        typeof slotData.capacity !== 'number' ||
+        typeof slotData.reservedCount !== 'number'
+      ) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Pickup slot ${pickupSlotId} has invalid configuration.`,
+        );
+      }
+
+      // Time validation in Asia/Kolkata
+      const kolkataTime = getKolkataTime();
+      const slotStartMinutes = parseTimeToMinutes(slotData.startTime);
+      const slotEndMinutes = parseTimeToMinutes(slotData.endTime);
+
+      // College operating hours: 08:00 to 19:00 IST
+      if (slotStartMinutes < 8 * 60 || slotEndMinutes > 19 * 60 || slotStartMinutes >= slotEndMinutes) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Pickup slot ${pickupSlotId} is outside operating hours (08:00 - 19:00 IST).`,
+        );
+      }
+
+      // Past slot rejection
+      if (slotData.date < kolkataTime.dateStr) {
+        throw new functions.https.HttpsError('failed-precondition', 'Cannot book a pickup slot in the past.');
+      }
+      if (slotData.date === kolkataTime.dateStr && slotStartMinutes <= kolkataTime.totalMinutes) {
+        throw new functions.https.HttpsError('failed-precondition', 'Pickup slot has already passed for today.');
+      }
+
+      // Capacity verification
+      if (slotData.reservedCount >= slotData.capacity) {
+        throw new functions.https.HttpsError(
+          'resource-exhausted',
+          `Pickup slot ${pickupSlotId} is full (Capacity: ${slotData.capacity}).`,
+        );
+      }
+
+      // --- READ 4: Cart Items for Cart-Backed Checkout Verification & Clearing ---
+      const cartRefs = sanitizedItems.map((i) =>
+        db.collection('users').doc(studentUid).collection('cart').doc(i.itemId),
+      );
+      const cartSnaps = await Promise.all(cartRefs.map((ref) => transaction.get(ref)));
+
+      for (let idx = 0; idx < sanitizedItems.length; idx++) {
+        const inputItem = sanitizedItems[idx];
+        const cartSnap = cartSnaps[idx];
+
+        if (!cartSnap.exists) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Item ${inputItem.itemId} is not present in your cart. Cart-backed checkout requires all items to exist in cart.`,
+          );
+        }
+        const cartData = cartSnap.data()!;
+        if (cartData.canteenId !== canteenId) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Cart item ${inputItem.itemId} belongs to canteen ${cartData.canteenId}, not ${canteenId}.`,
+          );
+        }
+        if (cartData.quantity !== inputItem.quantity) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Quantity mismatch for item ${inputItem.itemId}: cart has ${cartData.quantity}, requested ${inputItem.quantity}.`,
+          );
+        }
+      }
+
+      // --- READ 5: Catalog Items ---
+      const itemRefs = sanitizedItems.map((i) =>
+        canteenRef.collection('items').doc(i.itemId),
+      );
+      const itemSnaps = await Promise.all(itemRefs.map((ref) => transaction.get(ref)));
+
+      const itemsSnapshot: Array<{
+        itemId: string;
+        itemName: string;
+        categoryId: string;
+        unitPriceInPaise: number;
+        quantity: number;
+        lineTotalInPaise: number;
+      }> = [];
+
+      let subtotalInPaise = 0;
+
+      for (let idx = 0; idx < sanitizedItems.length; idx++) {
+        const inputItem = sanitizedItems[idx];
+        const snap = itemSnaps[idx];
+
+        if (!snap.exists) {
+          throw new functions.https.HttpsError(
+            'not-found',
+            `Item ${inputItem.itemId} not found in canteen ${canteenId}.`,
+          );
+        }
+        const itemData = snap.data()!;
+        if (itemData.isActive !== true) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Item ${itemData.name || inputItem.itemId} is no longer active.`,
+          );
+        }
+        if (itemData.isAvailable !== true) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Item ${itemData.name || inputItem.itemId} is currently out of stock.`,
+          );
+        }
+
+        const unitPriceInPaise = itemData.priceInPaise;
+        if (
+          typeof unitPriceInPaise !== 'number' ||
+          !Number.isInteger(unitPriceInPaise) ||
+          unitPriceInPaise < 0
+        ) {
+          throw new functions.https.HttpsError(
+            'internal',
+            `Corrupt price for item ${inputItem.itemId}.`,
+          );
+        }
+
+        const lineTotalInPaise = unitPriceInPaise * inputItem.quantity;
+        subtotalInPaise += lineTotalInPaise;
+
+        itemsSnapshot.push({
+          itemId: inputItem.itemId,
+          itemName: itemData.name || inputItem.itemId,
+          categoryId: itemData.categoryId || '',
+          unitPriceInPaise,
+          quantity: inputItem.quantity,
+          lineTotalInPaise,
+        });
+      }
+
+      const totalInPaise = subtotalInPaise;
+
+      // ======================================================================
+      // ALL READS ARE COMPLETE. NOW PERFORM ALL WRITES.
+      // ======================================================================
+
+      const pickupSlotSnapshot = {
+        slotId: pickupSlotId,
+        pickupDate: slotData.date,
+        pickupStartTime: slotData.startTime,
+        pickupEndTime: slotData.endTime,
+        timezone: 'Asia/Kolkata',
+      };
+
+      // Write 1: Order Document
+      const newOrderData = {
+        orderId,
+        studentUid,
+        canteenId,
+        pickupSlot: pickupSlotSnapshot,
+        itemsSnapshot,
+        subtotalInPaise,
+        totalInPaise,
+        currency: 'INR',
+        status: 'placed',
+        paymentStatus: 'pending',
+        paymentMethod,
+        idempotencyKey,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      transaction.set(orderRef, newOrderData);
+
+      // Write 2: Idempotency Record
+      transaction.set(idempotencyRef, {
+        studentUid,
+        orderId,
+        requestHash,
+        totalInPaise,
+        status: 'placed',
+        createdAt: serverTimestamp(),
+      });
+
+      // Write 3: Reserve Slot Capacity
+      transaction.update(slotRef, {
+        reservedCount: slotData.reservedCount + 1,
+        updatedAt: serverTimestamp(),
+      });
+
+      // Write 4: Delete submitted items from user's cart
+      for (let idx = 0; idx < cartSnaps.length; idx++) {
+        transaction.delete(cartRefs[idx]);
+      }
+
+      return {
+        isRetry: false,
+        orderId,
+        status: 'placed',
+        paymentStatus: 'pending',
+        totalInPaise,
+        subtotalInPaise,
+        pickupSlot: pickupSlotSnapshot,
+        itemsSnapshot,
+      };
+    });
+
+    return {
+      success: true,
+      ...result,
+    };
   },
 );
 

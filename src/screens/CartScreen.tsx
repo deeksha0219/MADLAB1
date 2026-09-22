@@ -68,54 +68,88 @@ const foodImages: any = {
   "Gobi Rice": require("../../assets/chinese.png"),
 };
 
+import auth from "@react-native-firebase/auth";
+
 export default function CartScreen() {
   const navigation = useNavigation<any>();
   const [cart, setCart] = useState<CartItem[]>([]);
   const [pickupTime, setPickupTime] = useState<Date>(new Date());
   const [showPicker, setShowPicker] = useState(false);
+  const currentUid = auth().currentUser?.uid;
 
   const formatTime = (date: Date) => {
-  let hours = date.getHours();
-  const minutes = date.getMinutes();
-  const ampm = hours >= 12 ? "PM" : "AM";
+    let hours = date.getHours();
+    const minutes = date.getMinutes();
+    const ampm = hours >= 12 ? "PM" : "AM";
 
-  hours = hours % 12;
-  hours = hours ? hours : 12;
+    hours = hours % 12;
+    hours = hours ? hours : 12;
 
-  return `${hours}:${minutes < 10 ? "0" + minutes : minutes} ${ampm}`;
-};
+    return `${hours}:${minutes < 10 ? "0" + minutes : minutes} ${ampm}`;
+  };
 
   useEffect(() => {
+    if (!currentUid) {
+      setCart([]);
+      return;
+    }
     const unsubscribe = firestore()
+      .collection("users")
+      .doc(currentUid)
       .collection("cart")
       .onSnapshot(snap => {
-        const data = snap.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-        })) as CartItem[];
+        const data = snap.docs.map(doc => {
+          const d = doc.data();
+          return {
+            id: doc.id,
+            name: doc.id,
+            price: 50, // Non-authoritative display placeholder
+            quantity: typeof d.quantity === 'number' ? d.quantity : 1,
+            canteenId: d.canteenId || 'BIG_MINGOS',
+          };
+        }) as (CartItem & { canteenId: string })[];
         setCart(data);
       });
     return () => unsubscribe();
-  }, []);
+  }, [currentUid]);
 
   const increase = async (id: string) => {
+    if (!currentUid) return;
     const item = cart.find(i => i.id === id);
-    if (item) {
-      await firestore().collection("cart").doc(id).update({
-        quantity: item.quantity + 1,
-      });
+    if (item && item.quantity < 99) {
+      await firestore()
+        .collection("users")
+        .doc(currentUid)
+        .collection("cart")
+        .doc(id)
+        .update({
+          quantity: item.quantity + 1,
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+        });
     }
   };
 
   const decrease = async (id: string) => {
+    if (!currentUid) return;
     const item = cart.find(i => i.id === id);
     if (item) {
       if (item.quantity <= 1) {
-        await firestore().collection("cart").doc(id).delete();
+        await firestore()
+          .collection("users")
+          .doc(currentUid)
+          .collection("cart")
+          .doc(id)
+          .delete();
       } else {
-        await firestore().collection("cart").doc(id).update({
-          quantity: item.quantity - 1,
-        });
+        await firestore()
+          .collection("users")
+          .doc(currentUid)
+          .collection("cart")
+          .doc(id)
+          .update({
+            quantity: item.quantity - 1,
+            updatedAt: firestore.FieldValue.serverTimestamp(),
+          });
       }
     }
   };
@@ -125,7 +159,7 @@ export default function CartScreen() {
 
   const renderItem = ({ item }: { item: CartItem }) => (
     <View style={styles.card}>
-      <Image source={foodImages[item.name]} style={styles.image} />
+      <Image source={foodImages[item.name] || require("../../assets/snacks.png")} style={styles.image} />
       <View style={{ flex: 1 }}>
         <Text style={styles.name}>{item.name}</Text>
         <Text style={styles.price}>₹{item.price}</Text>
@@ -188,9 +222,13 @@ export default function CartScreen() {
           if (cart.length === 0) {
             navigation.navigate("Home");
           } else {
+            const canteenId = (cart[0] as any)?.canteenId || "BIG_MINGOS";
             navigation.navigate("Payment", {
-              total: getTotal(),
+              canteenId,
+              items: cart.map(i => ({ itemId: i.id, quantity: i.quantity })),
+              pickupSlotId: "SLOT_DEFAULT",
               pickupTime: formatTime(pickupTime),
+              total: getTotal(),
             });
           }
         }}
