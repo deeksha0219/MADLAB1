@@ -11,62 +11,79 @@ import {
   ScrollView,
 } from "react-native";
 import { Accstyles } from "../styles/Studentstyles";
-import firestore from "@react-native-firebase/firestore";
-import Feather from "react-native-vector-icons/Feather";
+import { createStudentProfile, isValidRvuEmail } from "../services/profileService";
+import {
+  requestPhoneOtp,
+  confirmPhoneOtp,
+  getCurrentUser,
+} from "../services/authService";
 
 type Props = {
-  navigation: any;
-  route: any;
-  setIsAccountDone: (value: boolean) => void;
+  navigation?: any;
+  onNavigateToLogin?: () => void;
+  currentUser?: any;
 };
 
 export default function CreateAccountScreen({
-  setIsAccountDone,
+  navigation,
+  onNavigateToLogin,
+  currentUser,
 }: Props) {
   const [collegeId, setCollegeId] = useState("");
   const [name, setName] = useState("");
-  const [phone, setPhone] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [confirmPassword, setConfirmPassword] = useState("");
+  const [phone, setPhone] = useState(currentUser?.phoneNumber?.replace("+91", "") || "");
+  const [otp, setOtp] = useState("");
+  const [otpSent, setOtpSent] = useState(false);
+  const [confirmResult, setConfirmResult] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
   const scrollRef = useRef<ScrollView>(null);
+  const activeUser = currentUser || getCurrentUser();
 
-  const handleRegister = async () => {
-    if (!collegeId || !name || !phone || !password || !confirmPassword) {
-      Alert.alert("Error", "Please fill all fields!");
+  // --------------------------------------------------
+  // SEND OTP (Only needed if user is not already authenticated)
+  // --------------------------------------------------
+  const handleSendOtp = async () => {
+    const cleanPhone = phone.trim();
+    if (!cleanPhone || cleanPhone.length !== 10) {
+      Alert.alert("Invalid Phone", "Please enter a valid 10-digit phone number.");
       return;
     }
 
-    if (!collegeId.trim().toLowerCase().endsWith("@rvu.edu.in")) {
+    setLoading(true);
+    try {
+      const result = await requestPhoneOtp(cleanPhone);
+      if (!result.success || !result.confirmation) {
+        Alert.alert("Error", result.error || "Failed to send OTP.");
+        return;
+      }
+
+      setConfirmResult(result.confirmation);
+      setOtpSent(true);
+      Alert.alert("OTP Sent", "Verification code sent to your phone.");
+    } catch (err: any) {
+      Alert.alert("Error", err.message || "Failed to send OTP.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --------------------------------------------------
+  // REGISTER / COMPLETE PROFILE
+  // --------------------------------------------------
+  const handleRegister = async () => {
+    const cleanName = name.trim();
+    const cleanCollegeId = collegeId.trim().toLowerCase();
+
+    if (!cleanName || cleanName.length < 2) {
+      Alert.alert("Invalid Name", "Please enter your full name.");
+      return;
+    }
+
+    if (!isValidRvuEmail(cleanCollegeId)) {
       Alert.alert(
         "Invalid Email",
-        "Only @rvu.edu.in emails are allowed!"
-      );
-      return;
-    }
-
-    if (phone.length !== 10) {
-      Alert.alert(
-        "Error",
-        "Enter valid 10-digit phone number!"
-      );
-      return;
-    }
-
-    if (password !== confirmPassword) {
-      Alert.alert(
-        "Error",
-        "Passwords do not match!"
-      );
-      return;
-    }
-
-    if (password.length < 6) {
-      Alert.alert(
-        "Error",
-        "Password must be at least 6 characters!"
+        "Only official RV University emails (@rvu.edu.in) are allowed."
       );
       return;
     }
@@ -74,229 +91,163 @@ export default function CreateAccountScreen({
     setLoading(true);
 
     try {
-      const db = firestore();
+      let targetUser = activeUser;
 
-      // CHECK PHONE EXISTS
-      const phoneCheck = await db
-        .collection("users")
-        .where("phone", "==", phone)
-        .get();
+      // If not yet authenticated, verify OTP first
+      if (!targetUser) {
+        if (!confirmResult) {
+          Alert.alert("Error", "Please request and verify your phone OTP first.");
+          setLoading(false);
+          return;
+        }
 
-      if (!phoneCheck.empty) {
-        Alert.alert(
-          "Error",
-          "Phone number already registered!"
-        );
-        return;
+        const verifyRes = await confirmPhoneOtp(confirmResult, otp);
+        if (!verifyRes.success || !verifyRes.user) {
+          Alert.alert("Verification Failed", verifyRes.error || "Incorrect OTP code.");
+          setLoading(false);
+          return;
+        }
+
+        targetUser = verifyRes.user;
       }
 
-      // CHECK COLLEGE ID EXISTS
-      const idCheck = await db
-        .collection("users")
-        .where("collegeId", "==", collegeId)
-        .get();
-
-      if (!idCheck.empty) {
-        Alert.alert(
-          "Error",
-          "College ID already registered!"
-        );
-        return;
-      }
-
-      // SAVE TO FIRESTORE
-      await db.collection("users").add({
-        collegeId,
-        name,
-        phone,
-        password,
-        createdAt: new Date().toISOString(),
+      // Authoritative profile creation in users/{uid}
+      await createStudentProfile(targetUser.uid, {
+        name: cleanName,
+        collegeId: cleanCollegeId,
+        phone: targetUser.phoneNumber || `+91${phone.trim()}`,
       });
 
-      Alert.alert(
-        "✅ Success!",
-        "Account created! Please login."
-      );
-
-      setIsAccountDone(true);
-
-    } catch (err) {
-      console.log("Firebase error:", err);
-
-      Alert.alert(
-        "Error",
-        "Registration failed! Check your connection."
-      );
-
+      Alert.alert("Success! 🎉", "Your profile has been created successfully.");
+      // onAuthStateChanged / profile state will automatically transition the stack
+    } catch (err: any) {
+      console.error("Registration error:", err);
+      Alert.alert("Registration Error", err.message || "Failed to complete registration.");
     } finally {
       setLoading(false);
     }
   };
 
+  const handleGoToLogin = () => {
+    if (onNavigateToLogin) {
+      onNavigateToLogin();
+    } else if (navigation?.navigate) {
+      navigation.navigate("Login");
+    }
+  };
+
   return (
     <SafeAreaView style={Accstyles.container}>
-
       <ScrollView
         ref={scrollRef}
-        style={{
-          flex: 1,
-          width: "100%",
-        }}
-        contentContainerStyle={{
-          alignItems: "center",
-          paddingBottom: 300,
-        }}
+        style={{ flex: 1, width: "100%" }}
+        contentContainerStyle={{ alignItems: "center", paddingBottom: 100 }}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
         bounces={true}
       >
-
         <Image
           source={require("../../assets/logo_text.png")}
           style={Accstyles.logoImage}
         />
 
-        <Text style={Accstyles.welcome}>
-          Welcome! 👋
-        </Text>
-
-        <Text style={Accstyles.subtitle}>
-          Ready to skip the queue today?
-        </Text>
+        <Text style={Accstyles.welcome}>Welcome! 👋</Text>
+        <Text style={Accstyles.subtitle}>Create your GrabNGo Student Account</Text>
 
         <View style={Accstyles.card}>
+          <Text style={Accstyles.cardTitle}>Student Profile</Text>
 
-          <Text style={Accstyles.cardTitle}>
-            Create Account
-          </Text>
-
+          {/* RVU College Email */}
           <TextInput
-            placeholder="Enter your RVU Email ID"
+            placeholder="Enter your RVU Email ID (@rvu.edu.in)"
             placeholderTextColor="#555"
             style={Accstyles.input}
             value={collegeId}
             onChangeText={setCollegeId}
             autoCapitalize="none"
+            keyboardType="email-address"
+            editable={!loading}
           />
 
+          {/* Full Name */}
           <TextInput
             placeholder="Full Name"
             placeholderTextColor="#555"
             style={Accstyles.input}
             value={name}
             onChangeText={setName}
+            editable={!loading}
           />
 
-          <TextInput
-            placeholder="Phone Number"
-            placeholderTextColor="#555"
-            style={Accstyles.input}
-            keyboardType="number-pad"
-            maxLength={10}
-            value={phone}
-            onChangeText={setPhone}
-          />
+          {/* Phone Number (if not already authenticated) */}
+          {!activeUser && (
+            <>
+              <View style={{ flexDirection: "row", alignItems: "center", width: "100%" }}>
+                <TextInput
+                  placeholder="10-digit Mobile Number"
+                  placeholderTextColor="#555"
+                  style={[Accstyles.input, { flex: 1, marginBottom: 0 }]}
+                  keyboardType="number-pad"
+                  maxLength={10}
+                  value={phone}
+                  onChangeText={setPhone}
+                  editable={!otpSent && !loading}
+                />
+                <TouchableOpacity
+                  style={{
+                    backgroundColor: otpSent ? "gray" : "#E0533C",
+                    paddingVertical: 14,
+                    paddingHorizontal: 12,
+                    borderRadius: 8,
+                    marginLeft: 8,
+                  }}
+                  onPress={otpSent ? undefined : handleSendOtp}
+                  disabled={loading || otpSent}
+                >
+                  <Text style={{ color: "#FFF", fontWeight: "bold", fontSize: 13 }}>
+                    {otpSent ? "Sent ✓" : "Get OTP"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
 
-          <View style={{ position: "relative" }}>
+              {otpSent && (
+                <TextInput
+                  placeholder="Enter 6-digit OTP"
+                  placeholderTextColor="#555"
+                  style={[Accstyles.input, { marginTop: 12 }]}
+                  keyboardType="number-pad"
+                  maxLength={6}
+                  value={otp}
+                  onChangeText={setOtp}
+                  editable={!loading}
+                />
+              )}
+            </>
+          )}
 
-            <TextInput
-              placeholder="Create Password"
-              placeholderTextColor="#555"
-              secureTextEntry={!showPassword}
-              style={Accstyles.input}
-              value={password}
-              onChangeText={setPassword}
-            />
-
-            <TouchableOpacity
-              onPress={() =>
-                setShowPassword(!showPassword)
-              }
-              style={{
-                position: "absolute",
-                right: 18,
-                top: 12,
-              }}
-            >
-              <Feather
-                name={
-                  showPassword
-                    ? "eye"
-                    : "eye-off"
-                }
-                size={20}
-                color="#555"
-              />
-            </TouchableOpacity>
-
-          </View>
-
-          <View style={{ position: "relative" }}>
-
-            <TextInput
-              placeholder="Confirm Password"
-              placeholderTextColor="#555"
-              secureTextEntry={!showPassword}
-              style={Accstyles.input}
-              value={confirmPassword}
-              onChangeText={setConfirmPassword}
-            />
-
-            <TouchableOpacity
-              onPress={() =>
-                setShowPassword(!showPassword)
-              }
-              style={{
-                position: "absolute",
-                right: 18,
-                top: 12,
-              }}
-            >
-              <Feather
-                name={
-                  showPassword
-                    ? "eye"
-                    : "eye-off"
-                }
-                size={20}
-                color="#555"
-              />
-            </TouchableOpacity>
-
-          </View>
-
+          {/* Submit Button */}
           <TouchableOpacity
-            style={[
-              Accstyles.button,
-              loading && { opacity: 0.6 },
-            ]}
+            style={[Accstyles.button, loading && { opacity: 0.6 }]}
             onPress={handleRegister}
             disabled={loading}
           >
             {loading ? (
               <ActivityIndicator color="#fff" />
             ) : (
-              <Text style={Accstyles.buttonText}>
-                Start Now
-              </Text>
+              <Text style={Accstyles.buttonText}>Complete Registration</Text>
             )}
           </TouchableOpacity>
-
         </View>
 
-        <TouchableOpacity
-          onPress={() => setIsAccountDone(true)}
-        >
-          <Text style={Accstyles.footer}>
-            Already have an Account?{" "}
-            <Text style={Accstyles.login}>
-              LOGIN
+        {!activeUser && (
+          <TouchableOpacity onPress={handleGoToLogin} style={{ marginTop: 20 }}>
+            <Text style={Accstyles.footer}>
+              Already have an Account?{" "}
+              <Text style={Accstyles.login}>LOGIN</Text>
             </Text>
-          </Text>
-        </TouchableOpacity>
-
+          </TouchableOpacity>
+        )}
       </ScrollView>
-
     </SafeAreaView>
   );
 }

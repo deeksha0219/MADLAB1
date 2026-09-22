@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -11,12 +11,56 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import MaterialIcon from "react-native-vector-icons/MaterialIcons";
 import { categoryStyles as styles } from "../styles/Studentstyles";
 import firestore from "@react-native-firebase/firestore";
+import { formatPaiseToRupees } from "../services/catalogService";
 
 export default function CategoryScreen({ route, navigation }: any) {
-  const { category } = route.params;
+  const { category, canteenId = "BIG_MINGOS" } = route.params;
 
   const [availabilityMap, setAvailabilityMap] = useState<any>({});
   const [quantities, setQuantities] = useState<{ [key: string]: number }>({});
+  const [firestoreItems, setFirestoreItems] = useState<any[] | null>(null);
+  const [_loading, setLoading] = useState<boolean>(false);
+  const [_error, setError] = useState<string | null>(null);
+
+  // Fetch items dynamically from Firestore catalog subcollection
+  const fetchCategoryItems = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const snap = await firestore()
+        .collection("canteens")
+        .doc(canteenId)
+        .collection("items")
+        .where("categoryId", "==", category)
+        .where("isActive", "==", true)
+        .where("isAvailable", "==", true)
+        .get();
+
+      if (!snap.empty) {
+        const loaded = snap.docs.map(doc => {
+          const d = doc.data();
+          return {
+            id: doc.id,
+            name: d.name,
+            price: Math.floor((d.priceInPaise || 0) / 100),
+            priceInPaise: d.priceInPaise,
+            desc: d.description || "",
+            imageUrl: d.imageUrl,
+            image: null,
+          };
+        });
+        setFirestoreItems(loaded);
+      }
+    } catch {
+      setError("Could not refresh live items. Showing cached items.");
+    } finally {
+      setLoading(false);
+    }
+  }, [canteenId, category]);
+
+  useEffect(() => {
+    fetchCategoryItems();
+  }, [fetchCategoryItems]);
 
   // --------------------------------------------------
   // CHECK FOOD AVAILABILITY
@@ -336,7 +380,7 @@ export default function CategoryScreen({ route, navigation }: any) {
     ],
   };
 
-  const items = menu[category] || [];
+  const items = firestoreItems && firestoreItems.length > 0 ? firestoreItems : (menu[category] || []);
 
   // --------------------------------------------------
   // TOTAL ITEMS IN CART
@@ -380,26 +424,32 @@ export default function CategoryScreen({ route, navigation }: any) {
           <Text style={styles.headerTitle}>
             {category}
           </Text>
-
-          <MaterialIcon
-            name="search"
-            size={26}
-            color="black"
-          />
         </View>
 
-        {/* ITEMS */}
+        {items.length === 0 && (
+          <View style={{ alignItems: "center", marginTop: 40 }}>
+            <Text style={{ color: "#888", fontSize: 16 }}>
+              No items currently available in this category.
+            </Text>
+          </View>
+        )}
+
+        {/* LIST */}
 
         {items.map((item: any, index: number) => {
           const isAvailable =
-            availabilityMap[item.name] !== false;
+            availabilityMap[item.name] !== undefined
+              ? availabilityMap[item.name]
+              : item.isAvailable !== undefined
+              ? item.isAvailable
+              : true;
 
           const qty =
             quantities[item.name] || 0;
 
           return (
             <View
-              key={index}
+              key={item.id || index}
               style={[
                 styles.card,
                 !isAvailable && {
@@ -410,10 +460,17 @@ export default function CategoryScreen({ route, navigation }: any) {
 
               {/* FOOD IMAGE */}
 
-              <Image
-                source={item.image}
-                style={styles.image}
-              />
+              {item.imageUrl ? (
+                <Image
+                  source={{ uri: item.imageUrl }}
+                  style={styles.image}
+                />
+              ) : item.image ? (
+                <Image
+                  source={item.image}
+                  style={styles.image}
+                />
+              ) : null}
 
               {/* NAME + PRICE */}
 
@@ -423,7 +480,9 @@ export default function CategoryScreen({ route, navigation }: any) {
                 </Text>
 
                 <Text style={styles.price}>
-                  ₹{item.price}
+                  {typeof item.priceInPaise === "number"
+                    ? formatPaiseToRupees(item.priceInPaise)
+                    : `₹${item.price}`}
                 </Text>
               </View>
 

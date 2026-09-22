@@ -9,6 +9,7 @@ import FeatherIcon from "react-native-vector-icons/Feather";
 import { home as Homestyles } from "../styles/Studentstyles";
 import { useNavigation } from "@react-navigation/native";
 import firestore from "@react-native-firebase/firestore";
+import { getActiveCanteens, Canteen } from "../services/catalogService";
 
 export default function HomeScreen() {
   const navigation = useNavigation<any>();
@@ -18,6 +19,29 @@ export default function HomeScreen() {
   const [unavailableItems, setUnavailableItems] = useState<string[]>([]);
   const [selectedCanteen, setSelectedCanteen] = useState<string>("BIG MINGOS");
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
+  const [canteensList, setCanteensList] = useState<Canteen[]>([]);
+  const [_canteenLoading, setCanteenLoading] = useState<boolean>(false);
+  const [_canteenError, setCanteenError] = useState<string | null>(null);
+
+  // Fetch active canteens from Firestore with retry support
+  const loadCanteens = async () => {
+    setCanteenLoading(true);
+    setCanteenError(null);
+    try {
+      const list = await getActiveCanteens();
+      if (list && list.length > 0) {
+        setCanteensList(list);
+      }
+    } catch {
+      setCanteenError("Using cached canteen list");
+    } finally {
+      setCanteenLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadCanteens();
+  }, []);
 
   // ✅ FETCH UNAVAILABLE ITEMS FROM FIRESTORE
   useEffect(() => {
@@ -195,7 +219,10 @@ export default function HomeScreen() {
               style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.20)", justifyContent: "flex-start", paddingTop: 90, alignItems: "center" }}
             >
               <View style={{ width: "72%", backgroundColor: "#fff", borderRadius: 18, paddingVertical: 8, elevation: 8 }}>
-                {["BIG MINGOS", "M.M Foods (Library)", "M.M Foods (Admin Block)"].map((item, index) => (
+                {(canteensList.length > 0
+                  ? canteensList.map(c => c.name)
+                  : ["BIG MINGOS", "M.M Foods (Library)", "M.M Foods (Admin Block)"]
+                ).map((item, index, arr) => (
                   <TouchableOpacity
                     key={item}
                     onPress={() => {
@@ -204,7 +231,7 @@ export default function HomeScreen() {
                       if (item === "M.M Foods (Admin Block)") navigation.navigate("MMAdminBlock");
                       if (item === "M.M Foods (Library)") navigation.navigate("MMLibrary");
                     }}
-                    style={{ paddingVertical: 16, paddingHorizontal: 18, borderBottomWidth: index !== 2 ? 1 : 0, borderBottomColor: "#f1f1f1" }}
+                    style={{ paddingVertical: 16, paddingHorizontal: 18, borderBottomWidth: index !== arr.length - 1 ? 1 : 0, borderBottomColor: "#f1f1f1" }}
                   >
                     <Text style={{ fontSize: 16, fontWeight: "600", color: selectedCanteen === item ? "#E53935" : "#222" }}>
                       {item}

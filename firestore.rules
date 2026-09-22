@@ -1,0 +1,114 @@
+rules_version = '2';
+// ============================================================================
+// GrabNGo - Cloud Firestore Security Rules (Step 4 Hardened with diff() allowlist)
+//
+// SAFETY WARNING:
+// DO NOT DEPLOY TO STAGING IN STEP 4.
+// This ruleset is active strictly for local Firebase Emulator Suite testing.
+// Deployment to staging requires completion of all Step 4 tests, migration safety review,
+// and explicit written user approval.
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // ------------------------------------------------------------------------
+    // Student User Profiles: users/{userId}
+    // ------------------------------------------------------------------------
+    match /users/{userId} {
+      // Students can read ONLY their own profile if authenticated
+      allow read: if isOwner(userId);
+
+      // Direct client creation of profiles is strictly FORBIDDEN.
+      // Profile creation must be performed exclusively via the trusted
+      // 'createStudentProfile' Cloud Function using the Firebase Admin SDK.
+      allow create: if false;
+
+      // Profile updates:
+      // - Must be the authenticated owner
+      // - STRICT ALLOWLIST: Only 'name', 'collegeId', and 'updatedAt' may be modified by client
+      // - Any attempt to modify role, status, uid, phone, or createdAt is strictly denied
+      // - Passwords must NEVER be written
+      allow update: if isOwner(userId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'collegeId', 'updatedAt'])
+        && !('password' in request.resource.data);
+
+      // Deletion is strictly prohibited from client devices
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Canteen Admin Documents: admins/{adminId}
+    // ------------------------------------------------------------------------
+    match /admins/{adminId} {
+      // Admins can read ONLY their own admin record if active
+      allow read: if isOwner(adminId) && resource.data.status == 'active';
+
+      // Client writes to admin records are completely forbidden (Server SDK only)
+      allow write: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Canteens & Catalog Subcollections (Step 6)
+    // canteens/{canteenId}
+    // canteens/{canteenId}/categories/{categoryId}
+    // canteens/{canteenId}/items/{itemId}
+    // canteens/{canteenId}/items/{itemId}/private/{docId}
+    // ------------------------------------------------------------------------
+    function isCanteenAdmin(canteenId) {
+      return isAuthenticated()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.status == 'active'
+        && (canteenId in get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.canteenIds);
+    }
+
+    match /canteens/{canteenId} {
+      // Authenticated students can read active canteens; assigned admins can read any status
+      allow read: if isAuthenticated() && (
+        resource.data.isActive == true || isCanteenAdmin(canteenId)
+      );
+      // All writes must go through trusted Cloud Functions
+      allow write: if false;
+
+      match /categories/{categoryId} {
+        // Authenticated students can read active categories; assigned admins can read any status
+        allow read: if isAuthenticated() && (
+          resource.data.isActive == true || isCanteenAdmin(canteenId)
+        );
+        allow write: if false;
+      }
+
+      match /items/{itemId} {
+        // Authenticated students can read active & available items; assigned admins can read any status
+        allow read: if isAuthenticated() && (
+          (resource.data.isActive == true && resource.data.isAvailable == true)
+          || isCanteenAdmin(canteenId)
+        );
+        allow write: if false;
+
+        match /private/{docId} {
+          // Strictly restricted to active canteen admins assigned to this canteen
+          allow read: if isCanteenAdmin(canteenId);
+          allow write: if false;
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // Future Protected Collections (Orders, Carts, Payments)
+    // Remain denied until their respective steps are implemented.
+    // ------------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

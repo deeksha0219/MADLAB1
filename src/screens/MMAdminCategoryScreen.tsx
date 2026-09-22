@@ -58,7 +58,7 @@ export default function MMAdminCategoryScreen({ route, navigation }: any) {
       });
 
     return () => unsubscribe();
-  }, []);
+  }, [category]);
 
   // ✅ NEW — sync cart quantities live
   useEffect(() => {
