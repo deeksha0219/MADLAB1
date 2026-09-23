@@ -76,6 +76,14 @@ service cloud.firestore {
         allow read: if isOwner(userId);
         allow write: if false; // Cloud Functions only
       }
+
+      // ----------------------------------------------------------------------
+      // Payment Requests (Idempotency Tracking): users/{userId}/paymentRequests/{idempotencyKey}
+      // ----------------------------------------------------------------------
+      match /paymentRequests/{idempotencyKey} {
+        allow read: if isOwner(userId);
+        allow write: if false; // Cloud Functions only
+      }
     }
 
     // ------------------------------------------------------------------------
@@ -176,6 +184,46 @@ service cloud.firestore {
 
         // Direct client writes are strictly denied (Cloud Functions only)
         allow write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Payments Subcollection (Step 9)
+      // orders/{orderId}/payments/{paymentId}
+      // ----------------------------------------------------------------------
+      match /payments/{paymentId} {
+        // Students can read payments for their own orders
+        // Assigned active admins can read payments for assigned canteens
+        allow read: if isAuthenticated() && (
+          get(/databases/$(database)/documents/orders/$(orderId)).data.studentUid == request.auth.uid
+          || isCanteenAdmin(get(/databases/$(database)/documents/orders/$(orderId)).data.canteenId)
+        );
+
+        // Direct client writes are strictly denied (Cloud Functions only)
+        allow write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Payment History Subcollection (Step 9)
+      // orders/{orderId}/paymentHistory/{eventId}
+      // ----------------------------------------------------------------------
+      match /paymentHistory/{eventId} {
+        // Students can read payment history for their own orders
+        // Assigned active admins can read payment history for assigned canteens
+        allow read: if isAuthenticated() && (
+          get(/databases/$(database)/documents/orders/$(orderId)).data.studentUid == request.auth.uid
+          || isCanteenAdmin(get(/databases/$(database)/documents/orders/$(orderId)).data.canteenId)
+        );
+
+        // Direct client writes are strictly denied (Cloud Functions only)
+        allow write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Webhook Events Subcollection (Step 9 — Local-Only Emulator Verification)
+      // orders/{orderId}/webhookEvents/{eventId}
+      // ----------------------------------------------------------------------
+      match /webhookEvents/{eventId} {
+        allow read, write: if false; // Server-only
       }
     }
 

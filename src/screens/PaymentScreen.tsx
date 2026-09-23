@@ -10,6 +10,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { createOrderCallable } from "../services/orderService";
+import { createDemoPaymentCallable } from "../services/paymentService";
 
 function generateUuid(): string {
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
@@ -27,20 +28,21 @@ export default function PaymentScreen({ navigation, route }: any) {
   const total = route.params?.total || 0;
   const pickupTime = route.params?.pickupTime || "Not selected";
 
+  // Generic Demo Labels (Step 9 Correction 1)
   const upiMethods = [
     {
-      id: "phonepe",
-      label: "PhonePe",
+      id: "upi_demo",
+      label: "UPI Demo",
       icon: require("../../assets/phonepe.png"),
     },
     {
-      id: "googlepay",
-      label: "Google Pay",
+      id: "wallet_demo",
+      label: "Demo Wallet Payment",
       icon: require("../../assets/gpay.png"),
     },
     {
-      id: "paytm",
-      label: "Paytm",
+      id: "online_demo",
+      label: "Demo Online Payment",
       icon: require("../../assets/paytm.png"),
     },
   ];
@@ -59,7 +61,7 @@ export default function PaymentScreen({ navigation, route }: any) {
   ];
 
   // --------------------------------------------------
-  // PLACE ORDER VIA TRUSTED CLOUD FUNCTION (STEP 7)
+  // PLACE ORDER & INITIATE DEMO PAYMENT (STEP 9)
   // --------------------------------------------------
 
   const placeOrder = async () => {
@@ -83,7 +85,8 @@ export default function PaymentScreen({ navigation, route }: any) {
       const pickupSlotId = route.params?.pickupSlotId || "SLOT_DEFAULT";
       const paymentMethod = selected === "cash" ? "cash" : "upi_demo";
 
-      const result = await createOrderCallable({
+      // Step 1: Create Order via trusted server Cloud Function
+      const orderResult = await createOrderCallable({
         canteenId,
         items,
         pickupSlotId,
@@ -91,9 +94,20 @@ export default function PaymentScreen({ navigation, route }: any) {
         idempotencyKey: idempotencyKeyRef.current,
       });
 
+      let providerRef = orderResult.orderId;
+
+      // Step 2: For online demo payment, initiate server-owned demo payment record
+      if (paymentMethod === "upi_demo") {
+        const paymentResult = await createDemoPaymentCallable({
+          orderId: orderResult.orderId,
+          idempotencyKey: idempotencyKeyRef.current,
+        });
+        providerRef = paymentResult.providerReference || orderResult.orderId;
+      }
+
       navigation.navigate("OrderConfirmed", {
-        orderId: result.orderId,
-        referenceId: result.orderId,
+        orderId: orderResult.orderId,
+        referenceId: providerRef,
       });
 
     } catch (error: any) {
@@ -155,6 +169,37 @@ export default function PaymentScreen({ navigation, route }: any) {
           paddingBottom: 30,
         }}
       >
+        {/* DEMO NOTICE BANNER (Step 9) */}
+        <View
+          style={{
+            backgroundColor: "#FEF3C7",
+            borderColor: "#F59E0B",
+            borderWidth: 1,
+            borderRadius: 12,
+            padding: 12,
+            marginBottom: 15,
+          }}
+        >
+          <Text
+            style={{
+              color: "#92400E",
+              fontWeight: "bold",
+              fontSize: 13,
+            }}
+          >
+            ⚠️ Demo Mode — No real charges will be made
+          </Text>
+          <Text
+            style={{
+              color: "#B45309",
+              fontSize: 12,
+              marginTop: 2,
+            }}
+          >
+            Payments are simulated locally in the Firebase Emulator Suite.
+          </Text>
+        </View>
+
         {/* PICKUP TIME */}
 
         <View
