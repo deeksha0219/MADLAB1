@@ -365,6 +365,36 @@ async function runRealRulesEmulatorTests() {
       }));
     });
 
+    console.log('\n--- Step 9: Payment Security & Direct Read/Write Denial Tests ---');
+
+    await runTest('Direct client read of payments subcollection is DENIED (Cloud Functions only)', async () => {
+      const db = testEnv.authenticatedContext('student_alice').firestore();
+      await assertFails(db.collection('orders').doc('order_test_1').collection('payments').doc('pay_001').get());
+    });
+
+    await runTest('Direct client write to payments subcollection is DENIED', async () => {
+      const db = testEnv.authenticatedContext('student_alice').firestore();
+      await assertFails(db.collection('orders').doc('order_test_1').collection('payments').doc('pay_001').set({
+        amountInPaise: 100,
+        status: 'succeeded_demo',
+      }));
+    });
+
+    await runTest('Direct client read of paymentHistory subcollection is DENIED', async () => {
+      const db = testEnv.authenticatedContext('student_alice').firestore();
+      await assertFails(db.collection('orders').doc('order_test_1').collection('paymentHistory').doc('pay_001_processing').get());
+    });
+
+    await runTest('Direct client read of user paymentRequests is DENIED', async () => {
+      const db = testEnv.authenticatedContext('student_alice').firestore();
+      await assertFails(db.collection('users').doc('student_alice').collection('paymentRequests').doc('idemp_key_1').get());
+    });
+
+    await runTest('Direct client read of webhookEvents is DENIED', async () => {
+      const db = testEnv.authenticatedContext('student_alice').firestore();
+      await assertFails(db.collection('webhookEvents').doc('demo:evt_001').get());
+    });
+
   } finally {
     await testEnv.cleanup();
     console.log(`\n[Real Emulator Tests Summary] Total: ${testsPassed + testsFailed} | Passed: ${testsPassed} | Failed: ${testsFailed}`);

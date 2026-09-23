@@ -9,7 +9,6 @@
  * 5. Uses generic demo labels: UPI Demo, Demo Wallet Payment, Demo Online Payment.
  */
 
-import firestore from '@react-native-firebase/firestore';
 import functions from '@react-native-firebase/functions';
 
 export type DemoPaymentStatus =
@@ -18,9 +17,12 @@ export type DemoPaymentStatus =
   | 'succeeded_demo'
   | 'failed'
   | 'cancelled'
-  | 'expired'
-  | 'refund_pending'
-  | 'refunded_demo';
+  | 'expired';
+
+export type DemoRefundStatus =
+  | 'not_requested'
+  | 'pending'
+  | 'succeeded_demo';
 
 export interface PaymentRecord {
   readonly paymentId: string;
@@ -29,9 +31,10 @@ export interface PaymentRecord {
   readonly canteenId: string;
   readonly amountInPaise: number;
   readonly currency: 'INR';
-  readonly paymentMethod: 'upi_demo';
-  readonly provider: 'demo';
+  readonly paymentMethod: 'upi_demo' | 'demo_wallet' | 'demo_card' | string;
+  readonly provider: 'demo' | string;
   readonly status: DemoPaymentStatus;
+  readonly refundStatus?: DemoRefundStatus;
   readonly attemptNumber: number;
   readonly idempotencyKey?: string;
   readonly providerReference?: string;
@@ -199,78 +202,5 @@ export async function completeDemoRefundCallable(input: {
   } catch (err: any) {
     console.error('[paymentService] completeDemoRefundCallable error:', err);
     throw err;
-  }
-}
-
-/**
- * Fetches payments subcollection for an order.
- */
-export async function getOrderPayments(orderId: string): Promise<PaymentRecord[]> {
-  if (!orderId) return [];
-  try {
-    const snapshot = await firestore()
-      .collection('orders')
-      .doc(orderId)
-      .collection('payments')
-      .orderBy('createdAt', 'desc')
-      .get();
-
-    return snapshot.docs.map((doc) => {
-      const d = doc.data();
-      return {
-        paymentId: doc.id,
-        orderId: d.orderId || orderId,
-        canteenId: d.canteenId || '',
-        amountInPaise: d.amountInPaise || 0,
-        currency: d.currency || 'INR',
-        paymentMethod: d.paymentMethod || 'upi_demo',
-        provider: d.provider || 'demo',
-        status: d.status || 'pending',
-        attemptNumber: d.attemptNumber || 1,
-        providerReference: d.providerReference || '',
-        failureCode: d.failureCode || null,
-        failureMessage: d.failureMessage || null,
-        createdAt: d.createdAt,
-        updatedAt: d.updatedAt,
-        completedAt: d.completedAt || null,
-      };
-    });
-  } catch (err) {
-    console.error('[paymentService] getOrderPayments error:', err);
-    return [];
-  }
-}
-
-/**
- * Fetches payment history events for an order.
- */
-export async function getOrderPaymentHistory(orderId: string): Promise<PaymentHistoryEntry[]> {
-  if (!orderId) return [];
-  try {
-    const snapshot = await firestore()
-      .collection('orders')
-      .doc(orderId)
-      .collection('paymentHistory')
-      .orderBy('createdAt', 'asc')
-      .get();
-
-    return snapshot.docs.map((doc) => {
-      const d = doc.data();
-      return {
-        eventId: doc.id,
-        paymentId: d.paymentId || '',
-        orderId: d.orderId || orderId,
-        fromStatus: d.fromStatus || '',
-        toStatus: d.toStatus || '',
-        actorUid: d.actorUid || '',
-        actorRole: d.actorRole || '',
-        canteenId: d.canteenId || '',
-        reason: d.reason || '',
-        createdAt: d.createdAt,
-      };
-    });
-  } catch (err) {
-    console.error('[paymentService] getOrderPaymentHistory error:', err);
-    return [];
   }
 }

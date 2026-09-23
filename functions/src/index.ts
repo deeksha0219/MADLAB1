@@ -34,6 +34,15 @@ function serverTimestamp() {
   }
 }
 
+function timestampFromMillis(millis: number) {
+  try {
+    const { Timestamp } = require('@google-cloud/firestore');
+    return Timestamp.fromMillis(millis);
+  } catch {
+    return (admin.firestore as any).Timestamp.fromMillis(millis);
+  }
+}
+
 // Approved canteen identifiers in GrabNGo
 export const ALLOWED_CANTEEN_IDS = ['BIG_MINGOS', 'LIBRARY_CANTEEN'] as const;
 export type CanteenId = typeof ALLOWED_CANTEEN_IDS[number];
@@ -1008,14 +1017,15 @@ export const createOrder = functions.https.onCall(
     }
     const idempotencyKey = data.idempotencyKey;
 
-    // 5. Validate paymentMethod strictly
-    if (data.paymentMethod !== 'cash' && data.paymentMethod !== 'upi_demo') {
+    // 5. Validate paymentMethod strictly (Correction 1)
+    const ALLOWED_ORDER_PAYMENT_METHODS = ['cash', 'upi_demo', 'demo_wallet', 'demo_card'] as const;
+    if (!ALLOWED_ORDER_PAYMENT_METHODS.includes(data.paymentMethod)) {
       throw new functions.https.HttpsError(
         'invalid-argument',
-        "paymentMethod must be strictly 'cash' or 'upi_demo'. Live payment is deferred to Step 9.",
+        "paymentMethod must be one of: 'cash', 'upi_demo', 'demo_wallet', 'demo_card'.",
       );
     }
-    const paymentMethod: 'cash' | 'upi_demo' = data.paymentMethod;
+    const paymentMethod: (typeof ALLOWED_ORDER_PAYMENT_METHODS)[number] = data.paymentMethod;
 
     // 6. Validate pickupSlotId
     const pickupSlotId = validateId(data.pickupSlotId, 'pickupSlotId');
@@ -1397,7 +1407,6 @@ export const VALID_PAYMENT_STATUSES = [
   'pending',
   'processing',
   'succeeded_demo',
-  'demo_verified',
   'failed',
   'cancelled',
   'expired',
@@ -1704,17 +1713,16 @@ export const transitionOrderStatus = functions.https.onCall(
       // ALL READS & INVARIANT VALIDATIONS COMPLETE -> PERFORM ATOMIC WRITES
       // ======================================================================
 
-      // Write 1: Update order status (and paymentStatus if demo refund initiated)
-      const nextPaymentStatus =
-        isCancellationOrRejection && currentPaymentStatus === 'succeeded_demo'
-          ? 'refund_pending'
-          : currentPaymentStatus;
-
-      transaction.update(orderRef, {
+      // Write 1: Update order status and refundStatus (Section 2.2 & 2.3)
+      const isRefundInitiated = isCancellationOrRejection && currentPaymentStatus === 'succeeded_demo';
+      const orderUpdates: Record<string, any> = {
         status: nextStatus,
-        paymentStatus: nextPaymentStatus,
         updatedAt: serverTimestamp(),
-      });
+      };
+      if (isRefundInitiated) {
+        orderUpdates.refundStatus = 'pending';
+      }
+      transaction.update(orderRef, orderUpdates);
 
       // Write 2: Decrement slot capacity reservedCount (exactly once, validated newReservedCount >= 0)
       if (slotRef && validatedNewReservedCount !== null) {
@@ -1739,12 +1747,14 @@ export const transitionOrderStatus = functions.https.onCall(
         createdAt: serverTimestamp(),
       });
 
-      // Write 4: Process demo refund state & write payment history (Step 9 Ordering)
+      // Write 4: Process demo refund state & write payment history (Section 2.2 & Step 9 Ordering)
       if (activePaidPaymentSnap) {
         const paymentId = activePaidPaymentSnap.id;
         const paymentRef = orderRef.collection('payments').doc(paymentId);
+        const refundReference = `demo_ref_${crypto.randomUUID()}`;
         transaction.update(paymentRef, {
-          status: 'refund_pending',
+          refundStatus: 'pending',
+          refundReference,
           updatedAt: serverTimestamp(),
         });
 
@@ -1754,8 +1764,8 @@ export const transitionOrderStatus = functions.https.onCall(
           eventId: refundHistoryEventId,
           paymentId,
           orderId,
-          fromStatus: 'succeeded_demo',
-          toStatus: 'refund_pending',
+          fromStatus: 'not_requested',
+          toStatus: 'pending',
           actorUid: callerUid,
           actorRole,
           canteenId: orderData.canteenId,
@@ -1770,7 +1780,8 @@ export const transitionOrderStatus = functions.https.onCall(
         orderId,
         fromStatus: currentStatus,
         status: nextStatus,
-        paymentStatus: nextPaymentStatus,
+        paymentStatus: currentPaymentStatus,
+        refundStatus: isRefundInitiated ? 'pending' : (orderData.refundStatus || 'not_requested'),
       };
     });
   },
@@ -1849,9 +1860,9 @@ export const verifyDemoPayment = functions.https.onCall(
         );
       }
 
-      // Write 1: Update paymentStatus and order status
+      // Write 1: Update paymentStatus and order status (Canonical succeeded_demo per Step 9)
       transaction.update(orderRef, {
-        paymentStatus: 'demo_verified',
+        paymentStatus: 'succeeded_demo',
         status: 'payment_verified',
         updatedAt: serverTimestamp(),
       });
@@ -1875,7 +1886,7 @@ export const verifyDemoPayment = functions.https.onCall(
         success: true,
         orderId,
         status: 'payment_verified',
-        paymentStatus: 'demo_verified',
+        paymentStatus: 'succeeded_demo',
       };
     });
   },
@@ -2004,18 +2015,83 @@ export const searchAdminOrder = functions.https.onCall(
 );
 
 // ============================================================================
-// STEP 9: PAYMENT INTEGRATION FOUNDATION, DEMO PAYMENTS, & SECURITY
+// STEP 9: PAYMENT INTEGRATION FOUNDATION, DEMO PAYMENTS, & SECURITY HARDENING
 // ============================================================================
 
+export * from './payments/types';
+
+export type DemoPaymentMethod = 'upi_demo' | 'demo_wallet' | 'demo_card';
+export const ALLOWED_DEMO_PAYMENT_METHODS: readonly DemoPaymentMethod[] = [
+  'upi_demo',
+  'demo_wallet',
+  'demo_card',
+] as const;
+
+export type OrderPaymentMethod = 'cash' | DemoPaymentMethod;
+
 export type DemoPaymentStatus =
-  | 'pending'
+  | 'created'
   | 'processing'
   | 'succeeded_demo'
   | 'failed'
   | 'cancelled'
-  | 'expired'
-  | 'refund_pending'
-  | 'refunded_demo';
+  | 'expired';
+
+export type DemoRefundStatus =
+  | 'not_requested'
+  | 'pending'
+  | 'succeeded_demo';
+
+export const PAYMENT_ATTEMPT_TTL_MS = 15 * 60 * 1000; // 15 minutes
+export const MAX_PAYMENT_AMOUNT_PAISE = 500000; // 500,000 paise (₹5,000)
+
+/**
+ * Enforces strict emulator-only execution for demo payment operations.
+ */
+function assertEmulatorOnly(opName: string): void {
+  if (process.env.FUNCTIONS_EMULATOR !== 'true') {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `${opName} is only allowed in local emulator environment.`,
+    );
+  }
+}
+
+/**
+ * Validates allowed payment status transitions.
+ */
+export function validatePaymentTransition(
+  current: DemoPaymentStatus,
+  target: DemoPaymentStatus,
+): boolean {
+  if (current === 'created') {
+    return target === 'processing' || target === 'cancelled' || target === 'expired';
+  }
+  if (current === 'processing') {
+    return (
+      target === 'succeeded_demo' ||
+      target === 'failed' ||
+      target === 'cancelled' ||
+      target === 'expired'
+    );
+  }
+  return false;
+}
+
+/**
+ * Computes canonical request fingerprint from server-approved fields (Part 5).
+ */
+export function computeRequestFingerprint(
+  orderId: string,
+  paymentMethod: string,
+  amountInPaise: number,
+  currency: string,
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${orderId}\n${paymentMethod}\n${amountInPaise}\n${currency}`)
+    .digest('hex');
+}
 
 function sanitizeFailureCode(code: any): string {
   if (typeof code !== 'string' || !/^[A-Z0-9_]{3,32}$/.test(code)) {
@@ -2028,15 +2104,15 @@ function sanitizeFailureMessage(msg: any): string {
   if (typeof msg !== 'string' || msg.trim().length === 0) {
     return 'Simulated demo payment failure.';
   }
-  // Max 200 characters (Correction 9)
   return msg.trim().slice(0, 200);
 }
 
 /**
- * Callable Function: createDemoPayment (Step 9)
+ * Callable Function: createDemoPayment (Step 9 Hardening)
  *
- * Initiates an idempotent demo payment attempt for an order in 'placed' status.
+ * Initiates an idempotent demo payment attempt directly in 'processing' status.
  * Server derives amount directly from immutable order totalInPaise.
+ * Rejects cash and cod orders (Correction 1).
  * Enforces max 1 active attempt and max 3 failed attempts per order.
  */
 export const createDemoPayment = functions.https.onCall(
@@ -2050,22 +2126,45 @@ export const createDemoPayment = functions.https.onCall(
     }
     const studentUid = context.auth.uid;
 
-    // 2. Reject unknown fields
-    rejectUnknownFields(data, ['orderId', 'idempotencyKey'], 'createDemoPayment');
+    // 2. Exact allowlist check: payload must be an object with strictly keys { orderId, idempotencyKey }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'createDemoPayment expects a JSON object payload.',
+      );
+    }
+
+    const payloadKeys = Object.keys(data).sort();
+    const hasOnlyAllowedKeys =
+      payloadKeys.length === 2 &&
+      payloadKeys[0] === 'idempotencyKey' &&
+      payloadKeys[1] === 'orderId';
+
+    if (!hasOnlyAllowedKeys) {
+      const unexpected = payloadKeys.filter((k) => k !== 'orderId' && k !== 'idempotencyKey');
+      const missing = ['orderId', 'idempotencyKey'].filter((k) => !payloadKeys.includes(k));
+      const reasons: string[] = [];
+      if (unexpected.length > 0) reasons.push(`Unexpected field(s): ${unexpected.join(', ')}`);
+      if (missing.length > 0) reasons.push(`Missing field(s): ${missing.join(', ')}`);
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        `createDemoPayment payload must strictly contain only 'orderId' and 'idempotencyKey'. ${reasons.join('. ')}`,
+      );
+    }
 
     const orderId = validateId(data.orderId, 'orderId');
 
-    // Validate idempotencyKey (36-128 chars regex - Correction 9)
+    // 3. Validate idempotencyKey (1-128 chars alphanumeric/hyphen/underscore)
     if (
       typeof data.idempotencyKey !== 'string' ||
-      !/^[a-zA-Z0-9_-]{36,128}$/.test(data.idempotencyKey)
+      !/^[a-zA-Z0-9_-]{1,128}$/.test(data.idempotencyKey.trim())
     ) {
       throw new functions.https.HttpsError(
         'invalid-argument',
-        'idempotencyKey must be a 36-128 character alphanumeric/hyphen/underscore string.',
+        'idempotencyKey must be a 1-128 character alphanumeric/hyphen/underscore string.',
       );
     }
-    const idempotencyKey = data.idempotencyKey;
+    const idempotencyKey = data.idempotencyKey.trim();
 
     const orderRef = db.collection('orders').doc(orderId);
     const idempotencyRef = db
@@ -2090,13 +2189,23 @@ export const createDemoPayment = functions.https.onCall(
         );
       }
 
-      // Precondition: Order payment method must be upi_demo
-      if (orderData.paymentMethod !== 'upi_demo') {
+      // Precondition: Reject cash and cod orders (Correction 1)
+      if (orderData.paymentMethod === 'cash' || orderData.paymentMethod === 'cod') {
         throw new functions.https.HttpsError(
           'failed-precondition',
-          `Order paymentMethod is '${orderData.paymentMethod}'. Demo online payment requires 'upi_demo'.`,
+          `Order paymentMethod is '${orderData.paymentMethod}'. Cash orders cannot create online payment attempts.`,
         );
       }
+
+      // Precondition: Order payment method must be an allowed demo method
+      if (!ALLOWED_DEMO_PAYMENT_METHODS.includes(orderData.paymentMethod)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Order paymentMethod is '${orderData.paymentMethod}'. Online demo payment requires one of: ${ALLOWED_DEMO_PAYMENT_METHODS.join(', ')}.`,
+        );
+      }
+      // Never trust client: derive exclusively from server-owned order
+      const paymentMethod: DemoPaymentMethod = orderData.paymentMethod;
 
       // Precondition: Order must be in status 'placed'
       if (orderData.status !== 'placed') {
@@ -2106,11 +2215,66 @@ export const createDemoPayment = functions.https.onCall(
         );
       }
 
+      // Server-derived immutable total in paise (Part 3 & Correction 7)
+      const amountInPaise = orderData.pricing?.totalInPaise ?? orderData.totalInPaise;
+      if (
+        typeof amountInPaise !== 'number' ||
+        !Number.isSafeInteger(amountInPaise) ||
+        amountInPaise <= 0 ||
+        amountInPaise > MAX_PAYMENT_AMOUNT_PAISE
+      ) {
+        throw new functions.https.HttpsError('failed-precondition', 'Corrupted or oversized order amount.');
+      }
+
+      // Order total consistency check
+      if (
+        orderData.subtotalInPaise !== undefined &&
+        orderData.totalInPaise !== undefined &&
+        orderData.subtotalInPaise !== orderData.totalInPaise
+      ) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Order pricing total is inconsistent with subtotal.',
+        );
+      }
+
+      // Rule: Payment attempt rejected if order is expired or pickup slot has already begun or passed
+      if (orderData.orderExpiresAt && orderData.orderExpiresAt.toMillis?.() <= Date.now()) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Cannot initiate payment for an expired order.',
+        );
+      }
+      const kolkataTime = getKolkataTime();
+      const slotDate = orderData.pickupSlot?.pickupDate;
+      const slotStartTime = orderData.pickupSlot?.pickupStartTime;
+      if (slotDate && slotStartTime) {
+        const slotStartMinutes = parseTimeToMinutes(slotStartTime);
+        const isPastOrBegun =
+          slotDate < kolkataTime.dateStr ||
+          (slotDate === kolkataTime.dateStr && slotStartMinutes <= kolkataTime.totalMinutes);
+
+        if (isPastOrBegun) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'Cannot initiate payment after the pickup slot has already begun or passed.',
+          );
+        }
+      }
+
+      // Request Fingerprint (Part 5)
+      const requestFingerprint = computeRequestFingerprint(
+        orderId,
+        paymentMethod,
+        amountInPaise,
+        'INR',
+      );
+
       // READ 2: Idempotency Record
       const idempSnap = await transaction.get(idempotencyRef);
       if (idempSnap.exists) {
         const idempData = idempSnap.data()!;
-        if (idempData.orderId === orderId) {
+        if (idempData.requestFingerprint === requestFingerprint) {
           // Exact replay: return existing payment attempt
           const existingPaymentSnap = await transaction.get(
             orderRef.collection('payments').doc(idempData.paymentId),
@@ -2126,13 +2290,14 @@ export const createDemoPayment = functions.https.onCall(
               amountInPaise: pData.amountInPaise,
               currency: 'INR',
               providerReference: pData.providerReference,
+              expiresAt: pData.expiresAt,
             };
           }
         }
         // Different payload under same key: reject
         throw new functions.https.HttpsError(
           'already-exists',
-          `Idempotency key ${idempotencyKey} has already been used for another payment request.`,
+          `Idempotency key ${idempotencyKey} has already been used with different request parameters.`,
         );
       }
 
@@ -2149,18 +2314,7 @@ export const createDemoPayment = functions.https.onCall(
         );
       }
 
-      // Rule: Max 1 active attempt (pending or processing) (Correction 9)
-      const hasActive = existingPayments.some(
-        (p) => p.status === 'pending' || p.status === 'processing',
-      );
-      if (hasActive) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          `An active payment attempt is already in progress for order ${orderId}.`,
-        );
-      }
-
-      // Rule: Max 3 failed attempts per order (Correction 9)
+      // Rule: Max 3 failed attempts per order
       const failedCount = existingPayments.filter((p) => p.status === 'failed').length;
       if (failedCount >= 3) {
         throw new functions.https.HttpsError(
@@ -2169,17 +2323,62 @@ export const createDemoPayment = functions.https.onCall(
         );
       }
 
-      // Validations passed: generate new payment attempt
-      const attemptNumber = existingPayments.length + 1;
-      const paymentId = `PAY-${orderId.replace(/^GNG-/, '')}-${attemptNumber}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-      const providerReference = `DEMO-UPI-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
-      const amountInPaise = orderData.totalInPaise;
+      // Rule: Max 1 active attempt (processing) with Transaction-Safe Expiry (Correction 3 & 4)
+      const nowMs = Date.now();
+      for (const p of existingPayments) {
+        if (p.status === 'processing') {
+          const pExpiresMs = p.expiresAt?.toMillis?.() || 0;
+          const orderExpiresMs = orderData.activePaymentExpiresAt?.toMillis?.() || 0;
+          const isPaymentExpired = pExpiresMs <= nowMs;
+          const isOrderExpired = orderExpiresMs <= nowMs;
+          const isActiveOnOrder = orderData.activePaymentId === p.paymentId;
 
-      if (typeof amountInPaise !== 'number' || !Number.isInteger(amountInPaise) || amountInPaise <= 0) {
-        throw new functions.https.HttpsError('internal', 'Corrupted order amount.');
+          if (isActiveOnOrder && isPaymentExpired && isOrderExpired) {
+            // Lazy-expire active attempt transactionally
+            const expiredPaymentRef = orderRef.collection('payments').doc(p.paymentId);
+            transaction.update(expiredPaymentRef, {
+              status: 'expired',
+              expiredAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+
+            transaction.update(orderRef, {
+              activePaymentId: null,
+              activePaymentExpiresAt: null,
+              paymentStatus: 'pending',
+              updatedAt: serverTimestamp(),
+            });
+
+            const expireEventId = `${p.paymentId}_expired`;
+            const expireHistRef = orderRef.collection('paymentHistory').doc(expireEventId);
+            transaction.set(expireHistRef, {
+              eventId: expireEventId,
+              paymentId: p.paymentId,
+              orderId,
+              fromStatus: p.status,
+              toStatus: 'expired',
+              actorUid: studentUid,
+              actorRole: 'system',
+              canteenId: orderData.canteenId,
+              reason: 'Active payment attempt expired by TTL timeout',
+              createdAt: serverTimestamp(),
+            });
+          } else {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `An active payment attempt is already in progress for order ${orderId}.`,
+            );
+          }
+        }
       }
 
-      // Write 1: Payment Record (orders/{orderId}/payments/{paymentId})
+      // Validations passed: generate new payment attempt with Cryptographic Identifiers (Part 4)
+      const attemptNumber = existingPayments.length + 1;
+      const paymentId = `pay_${crypto.randomUUID()}`;
+      const providerReference = `demo_txn_${crypto.randomUUID()}`;
+      const expiresAt = timestampFromMillis(nowMs + PAYMENT_ATTEMPT_TTL_MS);
+
+      // Write 1: Payment Record (Created directly in 'processing' per Correction 2)
       const paymentRef = orderRef.collection('payments').doc(paymentId);
       transaction.set(paymentRef, {
         paymentId,
@@ -2188,46 +2387,59 @@ export const createDemoPayment = functions.https.onCall(
         canteenId: orderData.canteenId,
         amountInPaise,
         currency: 'INR',
-        paymentMethod: 'upi_demo',
+        paymentMethod,
         provider: 'demo',
-        status: 'pending',
+        status: 'processing',
+        refundStatus: 'not_requested',
         attemptNumber,
         idempotencyKey,
+        requestFingerprint,
         providerReference,
         failureCode: null,
         failureMessage: null,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
+        expiresAt,
         completedAt: null,
+        expiredAt: null,
+        refundedAt: null,
       });
 
-      // Write 2: Deterministic Payment History Event ({paymentId}_created - Correction 6)
-      const eventId = `${paymentId}_created`;
-      const historyRef = orderRef.collection('paymentHistory').doc(eventId);
-      transaction.set(historyRef, {
-        eventId,
+      // Write 2: Update Order Active Payment Tracking
+      transaction.update(orderRef, {
+        activePaymentId: paymentId,
+        activePaymentExpiresAt: expiresAt,
+        paymentStatus: 'processing',
+        updatedAt: serverTimestamp(),
+      });
+
+      // Write 3: Deterministic Payment History Event ({paymentId}_processing per Correction 4)
+      const procEventId = `${paymentId}_processing`;
+      transaction.set(orderRef.collection('paymentHistory').doc(procEventId), {
+        eventId: procEventId,
         paymentId,
         orderId,
         fromStatus: 'none',
-        toStatus: 'pending',
+        toStatus: 'processing',
         actorUid: studentUid,
         actorRole: 'student',
         canteenId: orderData.canteenId,
-        reason: `Demo payment attempt ${attemptNumber} initiated`,
+        reason: `Demo payment attempt ${attemptNumber} initiated directly in processing`,
         createdAt: serverTimestamp(),
       });
 
-      // Write 3: Idempotency Record (users/{studentUid}/paymentRequests/{idempotencyKey})
+      // Write 4: Idempotency Record (users/{studentUid}/paymentRequests/{idempotencyKey})
       transaction.set(idempotencyRef, {
         idempotencyKey,
+        requestFingerprint,
         studentUid,
         orderId,
         paymentId,
-        paymentMethod: 'upi_demo',
+        paymentMethod,
         amountInPaise,
-        status: 'pending',
+        currency: 'INR',
         createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+        expiresAt,
       });
 
       return {
@@ -2235,31 +2447,27 @@ export const createDemoPayment = functions.https.onCall(
         isRetry: false,
         paymentId,
         orderId,
-        status: 'pending',
+        status: 'processing',
         amountInPaise,
         currency: 'INR',
         providerReference,
+        expiresAt,
       };
     });
   },
 );
 
 /**
- * Callable Function: completeDemoPayment (Step 9 — Emulator Only)
+ * Callable Function: completeDemoPayment (Step 9 Hardening)
  *
  * Atomically marks payment attempt succeeded_demo and order status payment_verified.
- * Strictly guarded by FUNCTIONS_EMULATOR === 'true'.
- * Prevents duplicate completion and guarantees failed attempts cannot be completed.
+ * Only attempts in 'processing' status can become succeeded_demo (Correction 2).
+ * Prevents duplicate completion and guarantees failed/expired attempts cannot be completed.
  */
 export const completeDemoPayment = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard (Correction 3)
-    if (process.env.FUNCTIONS_EMULATOR !== 'true') {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'completeDemoPayment is an emulator-only testing helper and is disabled in cloud environments.',
-      );
-    }
+    // 1. Emulator Guard
+    assertEmulatorOnly('completeDemoPayment');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -2310,7 +2518,29 @@ export const completeDemoPayment = functions.https.onCall(
       }
       const paymentData = paymentSnap.data()!;
 
-      // Rule: Successful retry returns original result (Correction 5)
+      // Cross-resource verification: Payment must belong to this order
+      if (paymentData.orderId !== orderId) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          `Payment ${paymentId} does not belong to order ${orderId}.`,
+        );
+      }
+
+      // Precondition: Currency and Provider integrity
+      if (paymentData.currency !== 'INR') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Payment currency '${paymentData.currency}' is invalid. Must be 'INR'.`,
+        );
+      }
+      if (paymentData.provider !== 'demo') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Payment provider '${paymentData.provider}' is invalid. Must be 'demo'.`,
+        );
+      }
+
+      // Replay idempotency: Successful retry returns original result
       if (paymentData.status === 'succeeded_demo') {
         return {
           success: true,
@@ -2322,23 +2552,27 @@ export const completeDemoPayment = functions.https.onCall(
         };
       }
 
-      // Rule: Failed or cancelled attempts are IMMUTABLE; cannot transition to succeeded_demo (Correction 4)
-      if (paymentData.status === 'failed' || paymentData.status === 'cancelled') {
+      // Rule: Terminal states cannot be completed
+      if (
+        paymentData.status === 'failed' ||
+        paymentData.status === 'cancelled' ||
+        paymentData.status === 'expired'
+      ) {
         throw new functions.https.HttpsError(
           'failed-precondition',
           `Payment attempt ${paymentId} has status '${paymentData.status}' and cannot be completed. A new payment attempt is required.`,
         );
       }
 
-      // Rule: Payment must be pending or processing
-      if (paymentData.status !== 'pending' && paymentData.status !== 'processing') {
+      // Rule: Only 'processing' can become 'succeeded_demo' (Correction 2)
+      if (paymentData.status !== 'processing') {
         throw new functions.https.HttpsError(
           'failed-precondition',
-          `Invalid payment status transition from '${paymentData.status}' to 'succeeded_demo'.`,
+          `Only payments in 'processing' status can become 'succeeded_demo'. Current: '${paymentData.status}'.`,
         );
       }
 
-      // Rule: Order must be in 'placed' status (Correction 5: prevent duplicate success)
+      // Rule: Order must be in 'placed' status (prevent duplicate success)
       if (orderData.status !== 'placed') {
         if (orderData.status === 'payment_verified' || orderData.paymentStatus === 'succeeded_demo') {
           throw new functions.https.HttpsError(
@@ -2348,52 +2582,62 @@ export const completeDemoPayment = functions.https.onCall(
         }
         throw new functions.https.HttpsError(
           'failed-precondition',
-          `Order ${orderId} is in status '${orderData.status}'. Payment completion requires order status 'placed'.`,
+          `Order ${orderId} has status '${orderData.status}'. Payment completion requires status 'placed'.`,
         );
       }
 
-      // Write 1: Update Payment Document
+      // Rule: Payment amount must equal server order total in paise (Correction 7)
+      if (paymentData.amountInPaise !== orderData.totalInPaise) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Payment amount (${paymentData.amountInPaise}) does not match order total (${orderData.totalInPaise}).`,
+        );
+      }
+
+      // Write 1: Update payment record
       transaction.update(paymentRef, {
         status: 'succeeded_demo',
         updatedAt: serverTimestamp(),
         completedAt: serverTimestamp(),
       });
 
-      // Write 2: Update Order Status & PaymentStatus atomically
+      // Write 2: Update order paymentStatus & status atomically
       transaction.update(orderRef, {
         status: 'payment_verified',
         paymentStatus: 'succeeded_demo',
+        activePaymentId: null,
+        activePaymentExpiresAt: null,
         updatedAt: serverTimestamp(),
       });
 
-      // Write 3: Deterministic Payment History Event ({paymentId}_succeeded_demo - Correction 6)
+      // Write 3: Deterministic Payment History Event ({paymentId}_succeeded_demo)
       const payHistoryEventId = `${paymentId}_succeeded_demo`;
-      const payHistoryRef = orderRef.collection('paymentHistory').doc(payHistoryEventId);
-      transaction.set(payHistoryRef, {
+      const paymentHistoryRef = orderRef.collection('paymentHistory').doc(payHistoryEventId);
+      transaction.set(paymentHistoryRef, {
         eventId: payHistoryEventId,
         paymentId,
         orderId,
-        fromStatus: paymentData.status,
+        fromStatus: 'processing',
         toStatus: 'succeeded_demo',
         actorUid: callerUid,
-        actorRole: isAdmin ? 'admin' : 'demo_payment_gateway',
+        actorRole: isAdmin ? 'admin' : 'student',
         canteenId: orderData.canteenId,
-        reason: 'Demo UPI payment completed successfully in emulator',
+        reason: 'Demo payment completed successfully in emulator',
         createdAt: serverTimestamp(),
       });
 
-      // Write 4: Deterministic Order Status History Event (exactly one event - Correction 5)
-      const orderHistoryEventId = `${orderId}_placed_to_payment_verified`;
-      const orderHistoryRef = orderRef.collection('statusHistory').doc(orderHistoryEventId);
-      transaction.set(orderHistoryRef, {
-        eventId: orderHistoryEventId,
+      // Write 4: Deterministic Order Status History Event
+      const statusHistoryEventId = `${orderId}_placed_to_payment_verified`;
+      const statusHistoryRef = orderRef.collection('statusHistory').doc(statusHistoryEventId);
+      transaction.set(statusHistoryRef, {
+        eventId: statusHistoryEventId,
         orderId,
         fromStatus: 'placed',
         toStatus: 'payment_verified',
         actorUid: callerUid,
-        actorRole: isAdmin ? 'admin' : 'demo_payment_gateway',
+        actorRole: isAdmin ? 'admin' : 'student',
         canteenId: orderData.canteenId,
-        reason: 'Demo UPI payment verified locally in emulator',
+        reason: 'Demo payment verified in emulator',
         createdAt: serverTimestamp(),
       });
 
@@ -2410,21 +2654,14 @@ export const completeDemoPayment = functions.https.onCall(
 );
 
 /**
- * Callable Function: failDemoPayment (Step 9 — Emulator Only)
+ * Callable Function: failDemoPayment (Step 9 Hardening)
  *
- * Transitions payment attempt to 'failed' with sanitized failureCode & failureMessage.
- * Order status remains 'placed', paymentStatus updated to 'failed'.
- * Failed records are immutable.
+ * Records an immutable payment failure.
  */
 export const failDemoPayment = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard (Correction 3)
-    if (process.env.FUNCTIONS_EMULATOR !== 'true') {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'failDemoPayment is an emulator-only testing helper.',
-      );
-    }
+    // 1. Emulator Guard
+    assertEmulatorOnly('failDemoPayment');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -2455,26 +2692,33 @@ export const failDemoPayment = functions.https.onCall(
 
       // Ownership: Student owner or assigned admin
       const isStudentOwner = orderData.studentUid === callerUid;
+      let isAdmin = false;
       if (!isStudentOwner) {
         const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
-        const isAdmin =
+        isAdmin =
           adminSnap.exists &&
           adminSnap.data()?.status === 'active' &&
           (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
             adminSnap.data()?.role === 'platform_operator');
         if (!isAdmin) {
-          throw new functions.https.HttpsError('permission-denied', 'Not authorized.');
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'Caller is not authorized to fail payment for this order.',
+          );
         }
       }
 
-      // READ 2: Payment
+      // READ 2: Payment Document
       const paymentSnap = await transaction.get(paymentRef);
       if (!paymentSnap.exists) {
-        throw new functions.https.HttpsError('not-found', `Payment ${paymentId} not found.`);
+        throw new functions.https.HttpsError(
+          'not-found',
+          `Payment ${paymentId} not found under order ${orderId}.`,
+        );
       }
       const paymentData = paymentSnap.data()!;
 
-      // Idempotency: If already failed with same code/msg, return safe result
+      // Idempotency: Already failed
       if (paymentData.status === 'failed') {
         return {
           success: true,
@@ -2491,12 +2735,11 @@ export const failDemoPayment = functions.https.onCall(
       if (paymentData.status === 'succeeded_demo') {
         throw new functions.https.HttpsError(
           'failed-precondition',
-          'Cannot mark a succeeded payment as failed.',
+          'Cannot fail a payment attempt that has already succeeded.',
         );
       }
 
-      // Must be pending or processing
-      if (paymentData.status !== 'pending' && paymentData.status !== 'processing') {
+      if (paymentData.status !== 'processing' && paymentData.status !== 'created') {
         throw new functions.https.HttpsError(
           'failed-precondition',
           `Payment in status '${paymentData.status}' cannot transition to 'failed'.`,
@@ -2512,13 +2755,15 @@ export const failDemoPayment = functions.https.onCall(
         completedAt: serverTimestamp(),
       });
 
-      // Write 2: Update order paymentStatus (Order status remains 'placed'!)
+      // Write 2: Update order paymentStatus & clear active payment (Order status remains 'placed'!)
       transaction.update(orderRef, {
         paymentStatus: 'failed',
+        activePaymentId: null,
+        activePaymentExpiresAt: null,
         updatedAt: serverTimestamp(),
       });
 
-      // Write 3: Deterministic Payment History Event ({paymentId}_failed - Correction 6)
+      // Write 3: Deterministic Payment History Event ({paymentId}_failed)
       const eventId = `${paymentId}_failed`;
       const historyRef = orderRef.collection('paymentHistory').doc(eventId);
       transaction.set(historyRef, {
@@ -2528,7 +2773,7 @@ export const failDemoPayment = functions.https.onCall(
         fromStatus: paymentData.status,
         toStatus: 'failed',
         actorUid: callerUid,
-        actorRole: 'demo_payment_gateway',
+        actorRole: isAdmin ? 'admin' : 'student',
         canteenId: orderData.canteenId,
         reason: `Payment failed: [${failureCode}] ${failureMessage}`,
         createdAt: serverTimestamp(),
@@ -2548,19 +2793,14 @@ export const failDemoPayment = functions.https.onCall(
 );
 
 /**
- * Callable Function: cancelDemoPayment (Step 9 — Emulator Only)
+ * Callable Function: cancelDemoPayment (Step 9 Hardening)
  *
- * Cancels a pending or processing demo payment attempt on student request.
+ * Cancels a processing demo payment attempt on student request.
  */
 export const cancelDemoPayment = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard (Correction 3)
-    if (process.env.FUNCTIONS_EMULATOR !== 'true') {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'cancelDemoPayment is an emulator-only testing helper.',
-      );
-    }
+    // 1. Emulator Guard
+    assertEmulatorOnly('cancelDemoPayment');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -2613,7 +2853,7 @@ export const cancelDemoPayment = functions.https.onCall(
         };
       }
 
-      if (paymentData.status !== 'pending' && paymentData.status !== 'processing') {
+      if (paymentData.status !== 'processing' && paymentData.status !== 'created') {
         throw new functions.https.HttpsError(
           'failed-precondition',
           `Payment in status '${paymentData.status}' cannot be cancelled.`,
@@ -2627,13 +2867,15 @@ export const cancelDemoPayment = functions.https.onCall(
         completedAt: serverTimestamp(),
       });
 
-      // Write 2: Update order paymentStatus
+      // Write 2: Update order paymentStatus & clear active payment
       transaction.update(orderRef, {
         paymentStatus: 'cancelled',
+        activePaymentId: null,
+        activePaymentExpiresAt: null,
         updatedAt: serverTimestamp(),
       });
 
-      // Write 3: Deterministic Payment History Event ({paymentId}_cancelled - Correction 6)
+      // Write 3: Deterministic Payment History Event ({paymentId}_cancelled)
       const eventId = `${paymentId}_cancelled`;
       const historyRef = orderRef.collection('paymentHistory').doc(eventId);
       transaction.set(historyRef, {
@@ -2661,10 +2903,148 @@ export const cancelDemoPayment = functions.https.onCall(
 );
 
 /**
- * Callable Function: getPaymentStatus (Step 9)
+ * Callable Function: expirePaymentAttempt (Step 9 Hardening — Transaction-Safe Expiry Helper)
+ *
+ * Implements transaction-safe expiry for payment attempts past their TTL (Correction 3 & 8).
+ */
+export const expirePaymentAttempt = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    assertEmulatorOnly('expirePaymentAttempt');
+
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+    const callerUid = context.auth.uid;
+
+    rejectUnknownFields(data, ['orderId', 'paymentId'], 'expirePaymentAttempt');
+    const orderId = validateId(data.orderId, 'orderId');
+    const paymentId = validateId(data.paymentId, 'paymentId');
+
+    const orderRef = db.collection('orders').doc(orderId);
+    const paymentRef = orderRef.collection('payments').doc(paymentId);
+
+    return await db.runTransaction(async (transaction) => {
+      const orderSnap = await transaction.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new functions.https.HttpsError('not-found', `Order ${orderId} not found.`);
+      }
+      const orderData = orderSnap.data()!;
+
+      const paymentSnap = await transaction.get(paymentRef);
+      if (!paymentSnap.exists) {
+        throw new functions.https.HttpsError('not-found', `Payment ${paymentId} not found.`);
+      }
+      const paymentData = paymentSnap.data()!;
+
+      // Ownership: Student owner or assigned admin
+      const isStudentOwner = orderData.studentUid === callerUid;
+      let isAdmin = false;
+      if (!isStudentOwner) {
+        const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
+        isAdmin =
+          adminSnap.exists &&
+          adminSnap.data()?.status === 'active' &&
+          (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
+            adminSnap.data()?.role === 'platform_operator');
+        if (!isAdmin) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'Caller is not authorized to expire payment for this order.',
+          );
+        }
+      }
+
+      // Verify payment belongs to this order
+      if (paymentData.orderId !== orderId) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          `Payment ${paymentId} does not belong to order ${orderId}.`,
+        );
+      }
+
+      // Verify order status is 'placed'
+      if (orderData.status !== 'placed') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Cannot expire payment for order ${orderId} in status '${orderData.status}'. Order must be in 'placed' status.`,
+        );
+      }
+
+      // Verify order.activePaymentId === paymentId (Correction 3)
+      if (orderData.activePaymentId !== paymentId) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Cannot expire payment ${paymentId}: order activePaymentId is '${orderData.activePaymentId}'.`,
+        );
+      }
+
+      // Verify payment is active and non-terminal: strictly status === 'processing' (Correction 3)
+      if (paymentData.status !== 'processing') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Payment attempt ${paymentId} has status '${paymentData.status}' and cannot be expired. Status must be 'processing'.`,
+        );
+      }
+
+      // Verify payment.expiresAt and order.activePaymentExpiresAt are both past server time (Correction 3)
+      const nowMs = Date.now();
+      const pExpiresMs = paymentData.expiresAt?.toMillis?.() || 0;
+      const orderExpiresMs = orderData.activePaymentExpiresAt?.toMillis?.() || 0;
+
+      if (pExpiresMs > nowMs || orderExpiresMs > nowMs) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Payment attempt ${paymentId} has not yet expired on both payment and order relative to server time.`,
+        );
+      }
+
+      // Update payment
+      transaction.update(paymentRef, {
+        status: 'expired',
+        expiredAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      // Update order: status remains placed, paymentStatus returns to pending, active payment cleared
+      transaction.update(orderRef, {
+        status: 'placed',
+        activePaymentId: null,
+        activePaymentExpiresAt: null,
+        paymentStatus: 'pending',
+        updatedAt: serverTimestamp(),
+      });
+
+      // Deterministic Payment History Event ({paymentId}_expired - Correction 8)
+      const eventId = `${paymentId}_expired`;
+      const historyRef = orderRef.collection('paymentHistory').doc(eventId);
+      transaction.set(historyRef, {
+        eventId,
+        paymentId,
+        orderId,
+        fromStatus: paymentData.status,
+        toStatus: 'expired',
+        actorUid: callerUid,
+        actorRole: isAdmin ? 'admin' : isStudentOwner ? 'student' : 'system',
+        canteenId: orderData.canteenId,
+        reason: 'Payment attempt expired due to TTL timeout',
+        createdAt: serverTimestamp(),
+      });
+
+      return {
+        success: true,
+        orderId,
+        paymentId,
+        status: 'expired',
+      };
+    });
+  },
+);
+
+/**
+ * Callable Function: getPaymentStatus (Step 9 Hardening)
  *
  * Retrieves sanitized payment details with ownership authorization.
- * Limits admin reads to required operational fields (Correction 8).
+ * Limits admin reads to required operational fields, masking provider references (Part 10 & Correction 10).
  */
 export const getPaymentStatus = functions.https.onCall(
   async (data: Record<string, any>, context) => {
@@ -2709,7 +3089,7 @@ export const getPaymentStatus = functions.https.onCall(
     }
     const p = paymentSnap.data()!;
 
-    // Admin view: operational fields only, no synthetic provider references or internal codes (Correction 8)
+    // Admin view: operational fields only, no synthetic provider references or internal failure codes (Correction 8)
     if (isAdmin && !isStudentOwner) {
       return {
         success: true,
@@ -2718,12 +3098,14 @@ export const getPaymentStatus = functions.https.onCall(
           orderId: p.orderId,
           canteenId: p.canteenId,
           status: p.status,
+          refundStatus: p.refundStatus || 'not_requested',
           amountInPaise: p.amountInPaise,
           currency: p.currency,
           paymentMethod: p.paymentMethod,
           attemptNumber: p.attemptNumber,
           createdAt: p.createdAt,
           updatedAt: p.updatedAt,
+          expiresAt: p.expiresAt,
           completedAt: p.completedAt,
         },
       };
@@ -2737,6 +3119,7 @@ export const getPaymentStatus = functions.https.onCall(
         orderId: p.orderId,
         canteenId: p.canteenId,
         status: p.status,
+        refundStatus: p.refundStatus || 'not_requested',
         amountInPaise: p.amountInPaise,
         currency: p.currency,
         paymentMethod: p.paymentMethod,
@@ -2746,6 +3129,7 @@ export const getPaymentStatus = functions.https.onCall(
         failureMessage: p.failureMessage,
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
+        expiresAt: p.expiresAt,
         completedAt: p.completedAt,
       },
     };
@@ -2753,20 +3137,15 @@ export const getPaymentStatus = functions.https.onCall(
 );
 
 /**
- * Callable Function: requestDemoRefund (Step 9 — Emulator Only)
+ * Callable Function: requestDemoRefund (Step 9 Hardening — Emulator Only)
  *
  * Requests demo refund for an order that is cancelled or rejected after payment succeeded.
- * Strictly emulator-only.
+ * Separates refundStatus from payment.status (Section 2.2).
  */
 export const requestDemoRefund = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard (Correction 3)
-    if (process.env.FUNCTIONS_EMULATOR !== 'true') {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'requestDemoRefund is an emulator-only testing helper.',
-      );
-    }
+    // 1. Emulator Guard
+    assertEmulatorOnly('requestDemoRefund');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -2823,27 +3202,37 @@ export const requestDemoRefund = functions.https.onCall(
       }
       const paymentData = paymentSnap.data()!;
 
-      // Idempotency
-      if (paymentData.status === 'refund_pending') {
+      // Cross-resource verification: Payment must belong to this order
+      if (paymentData.orderId !== orderId) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          `Payment ${paymentId} does not belong to order ${orderId}.`,
+        );
+      }
+
+      // Idempotency: Already in refund state
+      if (paymentData.refundStatus === 'pending') {
+        const ref = paymentData.refundReference || `demo_ref_${crypto.randomUUID()}`;
         return {
           success: true,
           isRetry: true,
           orderId,
           paymentId,
-          status: 'refund_pending',
+          refundStatus: 'pending',
+          refundReference: ref,
         };
       }
-      if (paymentData.status === 'refunded_demo') {
+      if (paymentData.refundStatus === 'succeeded_demo') {
         return {
           success: true,
           isRetry: true,
           orderId,
           paymentId,
-          status: 'refunded_demo',
+          refundStatus: 'succeeded_demo',
         };
       }
 
-      // Must be succeeded_demo
+      // Precondition: Payment must have succeeded
       if (paymentData.status !== 'succeeded_demo') {
         throw new functions.https.HttpsError(
           'failed-precondition',
@@ -2851,27 +3240,31 @@ export const requestDemoRefund = functions.https.onCall(
         );
       }
 
-      // Write 1: Update payment status to refund_pending
+      // Write 1: Update payment refundStatus and assign refundReference
+      const refundReference = `demo_ref_${crypto.randomUUID()}`;
       transaction.update(paymentRef, {
-        status: 'refund_pending',
+        refundStatus: 'pending',
+        refundReason: reason,
+        refundReference,
+        refundRequestedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
 
-      // Write 2: Update order paymentStatus
+      // Write 2: Update order refundStatus (Order status remains cancelled/rejected!)
       transaction.update(orderRef, {
-        paymentStatus: 'refund_pending',
+        refundStatus: 'pending',
         updatedAt: serverTimestamp(),
       });
 
-      // Write 3: Deterministic Payment History Event ({paymentId}_refund_pending - Correction 6)
+      // Write 3: Deterministic Payment History Event ({paymentId}_refund_pending)
       const eventId = `${paymentId}_refund_pending`;
       const historyRef = orderRef.collection('paymentHistory').doc(eventId);
       transaction.set(historyRef, {
         eventId,
         paymentId,
         orderId,
-        fromStatus: 'succeeded_demo',
-        toStatus: 'refund_pending',
+        fromStatus: 'not_requested',
+        toStatus: 'pending',
         actorUid: callerUid,
         actorRole: isAdmin ? 'admin' : 'student',
         canteenId: orderData.canteenId,
@@ -2884,26 +3277,24 @@ export const requestDemoRefund = functions.https.onCall(
         isRetry: false,
         orderId,
         paymentId,
-        status: 'refund_pending',
+        refundStatus: 'pending',
+        refundReference,
       };
     });
   },
 );
 
 /**
- * Callable Function: completeDemoRefund (Step 9 — Emulator Only)
+ * Callable Function: completeDemoRefund (Step 9 Hardening — Emulator Only)
  *
- * Finalizes demo refund state to 'refunded_demo'. Admin authorization required.
+ * Finalizes demo refund state to 'succeeded_demo'. Admin authorization required.
+ * Derives full refund amount server-side; rejects client-supplied refund amounts (Correction 7).
+ * Order status remains 'cancelled' or 'rejected' (Section 2.3).
  */
 export const completeDemoRefund = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard (Correction 3)
-    if (process.env.FUNCTIONS_EMULATOR !== 'true') {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'completeDemoRefund is an emulator-only testing helper.',
-      );
-    }
+    // 1. Emulator Guard
+    assertEmulatorOnly('completeDemoRefund');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -2947,47 +3338,60 @@ export const completeDemoRefund = functions.https.onCall(
       }
       const paymentData = paymentSnap.data()!;
 
+      // Cross-resource verification: Payment must belong to this order
+      if (paymentData.orderId !== orderId) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          `Payment ${paymentId} does not belong to order ${orderId}.`,
+        );
+      }
+
       // Idempotency: Already refunded
-      if (paymentData.status === 'refunded_demo') {
+      if (paymentData.refundStatus === 'succeeded_demo') {
         return {
           success: true,
           isRetry: true,
           orderId,
           paymentId,
-          status: 'refunded_demo',
+          refundStatus: 'succeeded_demo',
+          refundedAmountInPaise: paymentData.refundedAmountInPaise,
         };
       }
 
-      // Precondition: Must be in refund_pending
-      if (paymentData.status !== 'refund_pending') {
+      // Precondition: Must be in refundStatus 'pending'
+      if (paymentData.refundStatus !== 'pending') {
         throw new functions.https.HttpsError(
           'failed-precondition',
-          `Payment in status '${paymentData.status}' cannot be finalized as refunded. Must be 'refund_pending'.`,
+          `Payment in refundStatus '${paymentData.refundStatus}' cannot be finalized as refunded. Must be 'pending'.`,
         );
       }
 
-      // Write 1: Update payment to refunded_demo
+      // Full refund derived from original payment record (Correction 7)
+      const refundedAmountInPaise = paymentData.amountInPaise;
+
+      // Write 1: Update payment refundStatus
       transaction.update(paymentRef, {
-        status: 'refunded_demo',
+        refundStatus: 'succeeded_demo',
+        refundedAmountInPaise,
+        refundedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-        completedAt: serverTimestamp(),
       });
 
-      // Write 2: Update order paymentStatus
+      // Write 2: Update order refundStatus (Order status remains cancelled/rejected!)
       transaction.update(orderRef, {
-        paymentStatus: 'refunded_demo',
+        refundStatus: 'refunded_demo',
         updatedAt: serverTimestamp(),
       });
 
-      // Write 3: Deterministic Payment History Event ({paymentId}_refunded_demo - Correction 6)
+      // Write 3: Deterministic Payment History Event ({paymentId}_refunded_demo)
       const eventId = `${paymentId}_refunded_demo`;
       const historyRef = orderRef.collection('paymentHistory').doc(eventId);
       transaction.set(historyRef, {
         eventId,
         paymentId,
         orderId,
-        fromStatus: 'refund_pending',
-        toStatus: 'refunded_demo',
+        fromStatus: 'pending',
+        toStatus: 'succeeded_demo',
         actorUid: callerUid,
         actorRole: 'admin',
         canteenId: orderData.canteenId,
@@ -3000,22 +3404,26 @@ export const completeDemoRefund = functions.https.onCall(
         isRetry: false,
         orderId,
         paymentId,
-        status: 'refunded_demo',
+        refundStatus: 'succeeded_demo',
+        refundedAmountInPaise,
       };
     });
   },
 );
 
 /**
- * HTTP Function: verifySyntheticWebhook (Step 9 — Local-Only Emulator Verification Harness)
+ * HTTP Function: verifySyntheticWebhook (Step 9 Hardening — Local-Only Verification Harness)
  *
- * Verifies raw-body HMAC-SHA256 signature using constant-time comparison (crypto.timingSafeEqual).
- * Implements idempotent processing for synthetic provider events.
- * Strictly guarded by FUNCTIONS_EMULATOR === 'true' (Correction 2 & 3).
+ * Implements 17-step verification:
+ * - Constant-time raw-body HMAC-SHA256 signature verification.
+ * - Scoped deduplication: /webhookEvents/{provider}:{eventId} (Correction 5).
+ * - Separate sub-handlers for payment.captured, payment.failed, refund.processed (Correction 6).
+ * - Transaction-bound event claiming and mutation (Part 11).
+ * - Strictly emulator-only.
  */
 export const verifySyntheticWebhook = functions.https.onRequest(
   async (req, res) => {
-    // 1. Emulator Guard (Correction 3)
+    // 1. Emulator Guard
     if (process.env.FUNCTIONS_EMULATOR !== 'true') {
       res.status(403).json({ error: 'verifySyntheticWebhook is disabled in cloud environments.' });
       return;
@@ -3026,29 +3434,28 @@ export const verifySyntheticWebhook = functions.https.onRequest(
       return;
     }
 
-    // 2. Validate raw body and signature header
+    // 2. Validate signature header
     const signature = req.headers['x-synthetic-signature'] as string;
     if (!signature || typeof signature !== 'string' || signature.trim().length === 0) {
       res.status(400).json({ error: 'Missing x-synthetic-signature header.' });
       return;
     }
 
-    // Raw body extraction (supports express rawBody buffer or string)
+    // 3. Extract raw body buffer
     const rawBodyBuffer: Buffer = (req as any).rawBody
       ? Buffer.from((req as any).rawBody)
       : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
 
-    // Secret from test environment (fallback test-only synthetic key, never committed)
     const syntheticSecret =
       process.env.SYNTHETIC_WEBHOOK_SECRET || 'emulator-test-synthetic-secret-key-32b';
 
-    // 3. Compute HMAC-SHA256 signature over raw request body
+    // 4. Compute expected HMAC-SHA256 signature
     const expectedSignature = crypto
       .createHmac('sha256', syntheticSecret)
       .update(rawBodyBuffer)
       .digest('hex');
 
-    // 4. Constant-time comparison using crypto.timingSafeEqual
+    // 5. Constant-time comparison using crypto.timingSafeEqual
     let isValidSignature = false;
     try {
       const sigBuf = Buffer.from(signature.trim(), 'hex');
@@ -3065,101 +3472,126 @@ export const verifySyntheticWebhook = functions.https.onRequest(
       return;
     }
 
-    // 5. Parse JSON payload
+    // 6. Safe JSON parse
     let payload: any;
     try {
-      payload = typeof req.body === 'object' && !Buffer.isBuffer(req.body)
-        ? req.body
-        : JSON.parse(rawBodyBuffer.toString('utf8'));
+      payload =
+        typeof req.body === 'object' && !Buffer.isBuffer(req.body)
+          ? req.body
+          : JSON.parse(rawBodyBuffer.toString('utf8'));
     } catch {
       res.status(400).json({ error: 'Invalid JSON payload.' });
       return;
     }
 
-    // 6. Validate Schema
-    const { eventId, eventType, orderId, paymentId, providerReference, amountInPaise } = payload || {};
+    // 7. Validate Schema
+    const { eventId, eventType, orderId, paymentId, providerReference, amountInPaise, currency, provider: payloadProvider } =
+      payload || {};
+    const ALLOWED_WEBHOOK_EVENTS = [
+      'payment.captured',
+      'payment.failed',
+      'refund.processed',
+      'payment.succeeded', // legacy test alias for payment.captured
+    ];
+
     if (
-      typeof eventId !== 'string' || !eventId ||
-      typeof eventType !== 'string' || !eventType ||
-      typeof orderId !== 'string' || !orderId ||
-      typeof paymentId !== 'string' || !paymentId ||
-      typeof providerReference !== 'string' || !providerReference ||
-      typeof amountInPaise !== 'number' || !Number.isInteger(amountInPaise) || amountInPaise <= 0
+      typeof eventId !== 'string' || !eventId || eventId.length > 128 ||
+      typeof eventType !== 'string' || !ALLOWED_WEBHOOK_EVENTS.includes(eventType) ||
+      typeof orderId !== 'string' || !orderId || orderId.length > 64 ||
+      typeof paymentId !== 'string' || !paymentId || paymentId.length > 64 ||
+      typeof providerReference !== 'string' || !providerReference || providerReference.length > 128 ||
+      typeof amountInPaise !== 'number' || !Number.isInteger(amountInPaise) || amountInPaise <= 0 ||
+      (currency !== undefined && currency !== 'INR') ||
+      (payloadProvider !== undefined && payloadProvider !== 'demo')
     ) {
-      res.status(400).json({ error: 'Invalid webhook event schema.' });
+      res.status(400).json({ error: 'Invalid webhook event schema or unsupported eventType.' });
       return;
     }
 
-    // 7. Check Duplicate Event Idempotency in orders/{orderId}/webhookEvents/{eventId}
-    const eventRef = db.collection('orders').doc(orderId).collection('webhookEvents').doc(eventId);
-    const existingEventSnap = await eventRef.get();
-    if (existingEventSnap.exists) {
-      res.status(200).json({
-        success: true,
-        isIdempotent: true,
-        status: 'already_processed',
-        eventId,
-      });
-      return;
-    }
+    const provider = 'demo';
+    // 8. Scoped Deduplication: /webhookEvents/{provider}:{eventId} (Correction 5)
+    const webhookDocId = `${provider}:${eventId}`;
+    const webhookRef = db.collection('webhookEvents').doc(webhookDocId);
 
-    // 8. Validate against server payment record
-    const paymentRef = db.collection('orders').doc(orderId).collection('payments').doc(paymentId);
-    const paymentSnap = await paymentRef.get();
-    if (!paymentSnap.exists) {
-      res.status(404).json({ error: `Payment ${paymentId} not found.` });
-      return;
-    }
-    const paymentData = paymentSnap.data()!;
+    // 9. Process inside transaction: claim event ID and apply side effects atomically
+    try {
+      let isReplay = false;
+      await db.runTransaction(async (transaction) => {
+        const webhookSnap = await transaction.get(webhookRef);
+        if (webhookSnap.exists) {
+          isReplay = true;
+          return;
+        }
 
-    if (paymentData.providerReference !== providerReference) {
-      res.status(400).json({
-        error: `Provider reference mismatch. Server has ${paymentData.providerReference}, webhook has ${providerReference}.`,
-      });
-      return;
-    }
+        const orderRef = db.collection('orders').doc(orderId);
+        const orderSnap = await transaction.get(orderRef);
+        if (!orderSnap.exists) {
+          throw new functions.https.HttpsError('not-found', `Order ${orderId} not found.`);
+        }
+        const orderData = orderSnap.data()!;
 
-    if (paymentData.amountInPaise !== amountInPaise) {
-      res.status(400).json({
-        error: `Amount mismatch. Server expected ${paymentData.amountInPaise}, webhook supplied ${amountInPaise}.`,
-      });
-      return;
-    }
+        const paymentRef = orderRef.collection('payments').doc(paymentId);
+        const paymentSnap = await transaction.get(paymentRef);
+        if (!paymentSnap.exists) {
+          throw new functions.https.HttpsError('not-found', `Payment ${paymentId} not found.`);
+        }
+        const paymentData = paymentSnap.data()!;
 
-    // 9. Process event atomically
-    await db.runTransaction(async (transaction) => {
-      // Record processed event
-      transaction.set(eventRef, {
-        eventId,
-        eventType,
-        orderId,
-        paymentId,
-        amountInPaise,
-        providerReference,
-        processedAt: serverTimestamp(),
-      });
+        // Cross-resource verification: payment must belong to order
+        if (paymentData.orderId !== orderId) {
+          throw new functions.https.HttpsError(
+            'invalid-argument',
+            `Payment ${paymentId} does not belong to order ${orderId}.`,
+          );
+        }
 
-      // If event indicates success, transition payment and order atomically
-      if (
-        eventType === 'payment.succeeded' &&
-        (paymentData.status === 'pending' || paymentData.status === 'processing')
-      ) {
-        transaction.update(paymentRef, {
-          status: 'succeeded_demo',
-          updatedAt: serverTimestamp(),
-          completedAt: serverTimestamp(),
-        });
+        // Currency verification
+        if (paymentData.currency !== 'INR') {
+          throw new functions.https.HttpsError(
+            'invalid-argument',
+            `Payment currency '${paymentData.currency}' mismatch.`,
+          );
+        }
 
-        transaction.update(db.collection('orders').doc(orderId), {
-          status: 'payment_verified',
-          paymentStatus: 'succeeded_demo',
-          updatedAt: serverTimestamp(),
-        });
+        // Dedicated Event Handlers (Correction 6)
+        if (eventType === 'payment.captured' || eventType === 'payment.succeeded') {
+          if (paymentData.providerReference !== providerReference) {
+            throw new functions.https.HttpsError(
+              'invalid-argument',
+              `Provider reference mismatch. Server: ${paymentData.providerReference}, Webhook: ${providerReference}.`,
+            );
+          }
 
-        const payHistoryId = `${paymentId}_succeeded_demo`;
-        transaction.set(
-          db.collection('orders').doc(orderId).collection('paymentHistory').doc(payHistoryId),
-          {
+          if (paymentData.amountInPaise !== amountInPaise) {
+            throw new functions.https.HttpsError(
+              'invalid-argument',
+              `Amount mismatch. Server expected ${paymentData.amountInPaise}, Webhook: ${amountInPaise}.`,
+            );
+          }
+
+          if (paymentData.status !== 'processing') {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Payment in status '${paymentData.status}' cannot be captured. Must be 'processing'.`,
+            );
+          }
+
+          transaction.update(paymentRef, {
+            status: 'succeeded_demo',
+            updatedAt: serverTimestamp(),
+            completedAt: serverTimestamp(),
+          });
+
+          transaction.update(orderRef, {
+            status: 'payment_verified',
+            paymentStatus: 'succeeded_demo',
+            activePaymentId: null,
+            activePaymentExpiresAt: null,
+            updatedAt: serverTimestamp(),
+          });
+
+          const payHistoryId = `${paymentId}_succeeded_demo`;
+          transaction.set(orderRef.collection('paymentHistory').doc(payHistoryId), {
             eventId: payHistoryId,
             paymentId,
             orderId,
@@ -3168,15 +3600,12 @@ export const verifySyntheticWebhook = functions.https.onRequest(
             actorUid: 'synthetic_webhook_gateway',
             actorRole: 'webhook_simulator',
             canteenId: paymentData.canteenId,
-            reason: 'Payment succeeded via verified synthetic webhook',
+            reason: 'Payment captured via verified synthetic webhook',
             createdAt: serverTimestamp(),
-          },
-        );
+          });
 
-        const orderHistoryId = `${orderId}_placed_to_payment_verified`;
-        transaction.set(
-          db.collection('orders').doc(orderId).collection('statusHistory').doc(orderHistoryId),
-          {
+          const orderHistoryId = `${orderId}_placed_to_payment_verified`;
+          transaction.set(orderRef.collection('statusHistory').doc(orderHistoryId), {
             eventId: orderHistoryId,
             orderId,
             fromStatus: 'placed',
@@ -3186,15 +3615,159 @@ export const verifySyntheticWebhook = functions.https.onRequest(
             canteenId: paymentData.canteenId,
             reason: 'Payment verified via verified synthetic webhook',
             createdAt: serverTimestamp(),
-          },
-        );
-      }
-    });
+          });
+        } else if (eventType === 'payment.failed') {
+          if (paymentData.providerReference !== providerReference) {
+            throw new functions.https.HttpsError(
+              'invalid-argument',
+              `Provider reference mismatch. Server: ${paymentData.providerReference}, Webhook: ${providerReference}.`,
+            );
+          }
 
-    res.status(200).json({
-      success: true,
-      isIdempotent: false,
-      processedEventId: eventId,
-    });
+          if (paymentData.amountInPaise !== amountInPaise) {
+            throw new functions.https.HttpsError(
+              'invalid-argument',
+              `Amount mismatch. Server expected ${paymentData.amountInPaise}, Webhook: ${amountInPaise}.`,
+            );
+          }
+
+          if (paymentData.status !== 'processing') {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Payment in status '${paymentData.status}' cannot transition to failed. Must be 'processing'.`,
+            );
+          }
+
+          transaction.update(paymentRef, {
+            status: 'failed',
+            failureCode: 'WEBHOOK_PAYMENT_FAILED',
+            failureMessage: 'Payment failed reported by webhook',
+            updatedAt: serverTimestamp(),
+            completedAt: serverTimestamp(),
+          });
+
+          transaction.update(orderRef, {
+            paymentStatus: 'failed',
+            activePaymentId: null,
+            activePaymentExpiresAt: null,
+            updatedAt: serverTimestamp(),
+          });
+
+          const payHistoryId = `${paymentId}_failed`;
+          transaction.set(orderRef.collection('paymentHistory').doc(payHistoryId), {
+            eventId: payHistoryId,
+            paymentId,
+            orderId,
+            fromStatus: paymentData.status,
+            toStatus: 'failed',
+            actorUid: 'synthetic_webhook_gateway',
+            actorRole: 'webhook_simulator',
+            canteenId: paymentData.canteenId,
+            reason: 'Payment failure recorded via webhook',
+            createdAt: serverTimestamp(),
+          });
+        } else if (eventType === 'refund.processed') {
+          // Correction 2: Strengthen handleRefundProcessed
+          if (paymentData.status !== 'succeeded_demo') {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Cannot process refund for payment in status '${paymentData.status}'. Must be 'succeeded_demo'.`,
+            );
+          }
+
+          // Idempotency: if already refunded, succeed idempotently
+          if (paymentData.refundStatus === 'succeeded_demo') {
+            isReplay = true;
+            return;
+          }
+
+          if (paymentData.refundStatus !== 'pending') {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Payment in refundStatus '${paymentData.refundStatus}' cannot receive refund. Must be 'pending'.`,
+            );
+          }
+
+          if (orderData.status !== 'cancelled' && orderData.status !== 'rejected') {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Order ${orderId} has status '${orderData.status}'. Refunds are only permitted for 'cancelled' or 'rejected' orders.`,
+            );
+          }
+
+          if (amountInPaise !== paymentData.amountInPaise) {
+            throw new functions.https.HttpsError(
+              'invalid-argument',
+              `Refund amount mismatch. Server original: ${paymentData.amountInPaise}, Webhook: ${amountInPaise}. Partial refunds rejected.`,
+            );
+          }
+
+          if (!paymentData.refundReference || providerReference !== paymentData.refundReference) {
+            functions.logger.warn(
+              `[Webhook] Refund reference validation failed for order ${orderId}, payment ${paymentId}.`,
+            );
+            throw new functions.https.HttpsError(
+              'invalid-argument',
+              'Refund provider reference mismatch.',
+            );
+          }
+
+          // Update ONLY refundStatus and refund audit fields (Order status remains cancelled/rejected!)
+          transaction.update(paymentRef, {
+            refundStatus: 'succeeded_demo',
+            refundedAmountInPaise: amountInPaise,
+            refundProviderReference: providerReference,
+            refundedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+
+          transaction.update(orderRef, {
+            refundStatus: 'refunded_demo',
+            updatedAt: serverTimestamp(),
+          });
+
+          const payHistoryId = `${paymentId}_refunded_demo`;
+          transaction.set(orderRef.collection('paymentHistory').doc(payHistoryId), {
+            eventId: payHistoryId,
+            paymentId,
+            orderId,
+            fromStatus: paymentData.refundStatus || 'pending',
+            toStatus: 'succeeded_demo',
+            actorUid: 'synthetic_webhook_gateway',
+            actorRole: 'webhook_simulator',
+            canteenId: paymentData.canteenId,
+            reason: 'Refund processed via verified synthetic webhook',
+            createdAt: serverTimestamp(),
+          });
+        }
+
+        // Claim webhook event atomically in the transaction (Correction 5)
+        transaction.set(webhookRef, {
+          provider,
+          eventId,
+          receivedAt: serverTimestamp(),
+          eventType,
+          processingStatus: 'processed',
+          paymentId,
+          orderId,
+          amountInPaise,
+          providerReference,
+        });
+      });
+
+      res.status(200).json({
+        success: true,
+        isIdempotent: isReplay,
+        processedEventId: eventId,
+      });
+    } catch (err: any) {
+      if (err instanceof functions.https.HttpsError) {
+        const statusCode =
+          err.code === 'not-found' ? 404 : err.code === 'invalid-argument' ? 400 : 409;
+        res.status(statusCode).json({ error: err.message });
+        return;
+      }
+      res.status(500).json({ error: 'Internal webhook processing error.' });
+    }
   },
 );

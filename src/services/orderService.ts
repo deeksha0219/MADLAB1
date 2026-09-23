@@ -51,9 +51,11 @@ export type OrderStatus =
 
 export type PaymentStatus =
   | 'pending'
-  | 'demo_verified'
+  | 'processing'
+  | 'succeeded_demo'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  | 'expired';
 
 export interface OrderStatusHistoryEvent {
   readonly eventId: string;
