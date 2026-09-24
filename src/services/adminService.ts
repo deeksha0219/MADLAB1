@@ -12,7 +12,7 @@ import firestore from '@react-native-firebase/firestore';
 
 export interface AdminProfile {
   readonly uid: string;
-  readonly role: 'canteen_admin';
+  readonly role: 'canteen_admin' | 'service_desk' | 'platform_operator';
   readonly canteenIds: string[];
   readonly status: 'active' | 'inactive';
   readonly createdAt?: any;
@@ -43,13 +43,18 @@ export async function getAdminProfile(uid: string): Promise<AdminProfile | null>
     }
 
     const data = docSnap.data();
-    if (!data || data.status !== 'active' || data.role !== 'canteen_admin') {
+    const isAuthorizedRole =
+      data &&
+      data.status === 'active' &&
+      (data.role === 'canteen_admin' || data.role === 'service_desk' || data.role === 'platform_operator');
+
+    if (!isAuthorizedRole) {
       return null;
     }
 
     return {
       uid: docSnap.id,
-      role: 'canteen_admin',
+      role: data.role,
       canteenIds: Array.isArray(data.canteenIds) ? data.canteenIds : [],
       status: 'active',
       createdAt: data.createdAt,

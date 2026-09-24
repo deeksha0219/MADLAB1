@@ -431,3 +431,187 @@ export async function getStudentOrderHistory(studentUid: string): Promise<OrderD
     };
   });
 }
+
+// ============================================================================
+// STEP 11: SERVICE DESK & ADMIN OPERATIONAL INTERFACES & CALLABLES
+// ============================================================================
+
+export interface OperationalNote {
+  readonly noteId: string;
+  readonly orderId: string;
+  readonly canteenId: string;
+  readonly authorUid: string;
+  readonly authorRole: 'canteen_admin' | 'service_desk';
+  readonly body: string;
+  readonly createdAt: any;
+  readonly updatedAt?: any;
+}
+
+export interface OrderAuditEvent {
+  readonly eventId: string;
+  readonly orderId: string;
+  readonly canteenId: string;
+  readonly eventType: string;
+  readonly fromStatus?: string;
+  readonly toStatus?: string;
+  readonly actorUid: string;
+  readonly actorRole: string;
+  readonly reason?: string;
+  readonly createdAt: any;
+}
+
+export interface OperationalOrder {
+  readonly orderId: string;
+  readonly shortOrderReference: string;
+  readonly canteenId: string;
+  readonly orderStatus: OrderStatus;
+  readonly status: OrderStatus;
+  readonly paymentStatus: PaymentStatus;
+  readonly refundStatus?: string;
+  readonly pickupSlot: any;
+  readonly itemCount: number;
+  readonly totalInPaise: number;
+  readonly maskedCustomer: string;
+  readonly createdAt: any;
+  readonly updatedAt?: any;
+  readonly activePaymentId?: string | null;
+  readonly itemsSnapshot?: OrderItemSnapshot[];
+  readonly operationalNotes?: OperationalNote[];
+  readonly auditHistory?: OrderAuditEvent[];
+}
+
+/**
+ * Calls 'listOperationalOrders' Cloud Function (Step 11).
+ */
+export async function listOperationalOrdersCallable(input?: {
+  canteenId?: string;
+  status?: OrderStatus;
+  pickupDate?: string;
+  limit?: number;
+  cursor?: string;
+}): Promise<{
+  success: boolean;
+  canteenId?: string;
+  count: number;
+  orders: OperationalOrder[];
+}> {
+  try {
+    const callable = functions().httpsCallable('listOperationalOrders');
+    const response = await callable(input || {});
+    return response.data as {
+      success: boolean;
+      canteenId?: string;
+      count: number;
+      orders: OperationalOrder[];
+    };
+  } catch (err: any) {
+    console.error('[orderService] listOperationalOrdersCallable error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Calls 'searchOperationalOrders' Cloud Function (Step 11).
+ */
+export async function searchOperationalOrdersCallable(input: {
+  query: string;
+  canteenId?: string;
+}): Promise<{
+  success: boolean;
+  found: boolean;
+  order: OperationalOrder | null;
+}> {
+  try {
+    const callable = functions().httpsCallable('searchOperationalOrders');
+    const response = await callable(input);
+    return response.data as {
+      success: boolean;
+      found: boolean;
+      order: OperationalOrder | null;
+    };
+  } catch (err: any) {
+    console.error('[orderService] searchOperationalOrdersCallable error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Calls 'getOperationalOrderDetails' Cloud Function (Step 11).
+ */
+export async function getOperationalOrderDetailsCallable(input: {
+  orderId: string;
+}): Promise<{
+  success: boolean;
+  order: OperationalOrder;
+}> {
+  try {
+    const callable = functions().httpsCallable('getOperationalOrderDetails');
+    const response = await callable(input);
+    return response.data as {
+      success: boolean;
+      order: OperationalOrder;
+    };
+  } catch (err: any) {
+    console.error('[orderService] getOperationalOrderDetailsCallable error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Calls 'createOperationalNote' Cloud Function (Step 11).
+ */
+export async function createOperationalNoteCallable(input: {
+  orderId: string;
+  body: string;
+}): Promise<{
+  success: boolean;
+  noteId: string;
+  orderId: string;
+}> {
+  try {
+    const callable = functions().httpsCallable('createOperationalNote');
+    const response = await callable(input);
+    return response.data as {
+      success: boolean;
+      noteId: string;
+      orderId: string;
+    };
+  } catch (err: any) {
+    console.error('[orderService] createOperationalNoteCallable error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Calls 'transitionOperationalOrderStatus' Cloud Function (Step 11).
+ */
+export async function transitionOperationalOrderStatusCallable(input: {
+  orderId: string;
+  targetStatus: OrderStatus;
+  reason?: string;
+  idempotencyKey?: string;
+}): Promise<{
+  success: boolean;
+  isIdempotent?: boolean;
+  orderId: string;
+  status: OrderStatus;
+  paymentStatus: PaymentStatus;
+  refundStatus?: string;
+}> {
+  try {
+    const callable = functions().httpsCallable('transitionOperationalOrderStatus');
+    const response = await callable(input);
+    return response.data as {
+      success: boolean;
+      isIdempotent?: boolean;
+      orderId: string;
+      status: OrderStatus;
+      paymentStatus: PaymentStatus;
+      refundStatus?: string;
+    };
+  } catch (err: any) {
+    console.error('[orderService] transitionOperationalOrderStatusCallable error:', err);
+    throw err;
+  }
+}
+

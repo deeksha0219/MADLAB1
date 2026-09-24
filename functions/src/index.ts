@@ -355,6 +355,13 @@ async function verifyAdminForCanteen(
   }
 
   const data = adminDoc.data()!;
+  if (data.role === 'service_desk') {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Service desk operators are not authorized to perform catalog administration.',
+    );
+  }
+
   if (data.role === 'platform_operator' || data.isOperator === true) {
     return;
   }
@@ -367,6 +374,64 @@ async function verifyAdminForCanteen(
       `Caller is not an authorized administrator for canteen ${canteenId}.`,
     );
   }
+}
+
+/**
+ * Step 11: Helper to verify active operational access (admin, service_desk, platform_operator).
+ * Returns caller details including assigned canteens.
+ */
+export type OperationalRole = 'platform_operator' | 'canteen_admin' | 'service_desk';
+
+export async function verifyOperationalAccess(
+  context: functions.https.CallableContext,
+  canteenId?: string,
+  allowedRoles: OperationalRole[] = ['platform_operator', 'canteen_admin', 'service_desk'],
+): Promise<{ uid: string; role: OperationalRole; canteenIds: string[] }> {
+  if (!context.auth || !context.auth.uid) {
+    throw new functions.https.HttpsError(
+      'unauthenticated',
+      'Authentication required for operational access.',
+    );
+  }
+
+  const callerUid = context.auth.uid;
+  const adminDoc = await db.collection('admins').doc(callerUid).get();
+  if (!adminDoc.exists || adminDoc.data()?.status !== 'active') {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Active operational privileges required.',
+    );
+  }
+
+  const data = adminDoc.data()!;
+  const rawRole = data.role as OperationalRole;
+  const isOperator = data.isOperator === true || rawRole === 'platform_operator';
+
+  if (!isOperator && !allowedRoles.includes(rawRole)) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      `Role '${rawRole}' is not authorized for this operation.`,
+    );
+  }
+
+  const role: OperationalRole = isOperator
+    ? 'platform_operator'
+    : rawRole === 'service_desk'
+    ? 'service_desk'
+    : 'canteen_admin';
+
+  const assignedCanteens: string[] = Array.isArray(data.canteenIds) ? data.canteenIds : [];
+
+  if (canteenId) {
+    if (!isOperator && !assignedCanteens.includes(canteenId)) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        `Caller is not authorized for canteen ${canteenId}.`,
+      );
+    }
+  }
+
+  return { uid: callerUid, role, canteenIds: assignedCanteens };
 }
 
 function validatePriceInPaise(price: any): number {
@@ -1552,19 +1617,20 @@ export const transitionOrderStatus = functions.https.onCall(
     const callerUid = context.auth.uid;
 
     // 2. Reject unknown & client-injected authoritative fields
-    rejectUnknownFields(data, ['orderId', 'nextStatus', 'reason'], 'transitionOrderStatus');
+    rejectUnknownFields(data, ['orderId', 'nextStatus', 'targetStatus', 'reason', 'idempotencyKey'], 'transitionOrderStatus');
 
     const orderId = validateId(data.orderId, 'orderId');
+    const rawNext = data.targetStatus || data.nextStatus;
     if (
-      typeof data.nextStatus !== 'string' ||
-      !VALID_ORDER_STATUSES.includes(data.nextStatus as OrderStatus)
+      typeof rawNext !== 'string' ||
+      !VALID_ORDER_STATUSES.includes(rawNext as OrderStatus)
     ) {
       throw new functions.https.HttpsError(
         'invalid-argument',
-        `Invalid nextStatus: ${data.nextStatus}. Must be one of: ${VALID_ORDER_STATUSES.join(', ')}.`,
+        `Invalid nextStatus: ${rawNext}. Must be one of: ${VALID_ORDER_STATUSES.join(', ')}.`,
       );
     }
-    const nextStatus = data.nextStatus as OrderStatus;
+    const nextStatus = rawNext as OrderStatus;
 
     let reason: string | undefined = undefined;
     if (data.reason !== undefined && data.reason !== null) {
@@ -1612,7 +1678,7 @@ export const transitionOrderStatus = functions.https.onCall(
       // READ 2: Caller Admin Profile (if not student owner)
       const isStudentOwner = orderData.studentUid === callerUid;
       let isAdmin = false;
-      let actorRole: 'student' | 'canteen_admin' = 'student';
+      let actorRole: 'student' | 'canteen_admin' | 'service_desk' = 'student';
 
       const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
       if (adminSnap.exists && adminSnap.data()?.status === 'active') {
@@ -1622,8 +1688,10 @@ export const transitionOrderStatus = functions.https.onCall(
           adminData.isOperator === true ||
           (Array.isArray(adminData.canteenIds) && adminData.canteenIds.includes(orderData.canteenId))
         ) {
-          isAdmin = true;
-          actorRole = 'canteen_admin';
+          if (['service_desk', 'canteen_admin', 'platform_operator'].includes(adminData.role) || adminData.isOperator === true) {
+            isAdmin = true;
+            actorRole = adminData.role === 'service_desk' ? 'service_desk' : 'canteen_admin';
+          }
         }
       }
 
@@ -1777,6 +1845,21 @@ export const transitionOrderStatus = functions.https.onCall(
         actorUid: callerUid,
         actorRole,
         canteenId: orderData.canteenId,
+        reason: reason || (isStudentOwner ? 'Cancelled by student' : `Status updated to ${nextStatus}`),
+        createdAt: serverTimestamp(),
+      });
+
+      // Write 3b: Append deterministic immutable auditEvents entry (Step 11)
+      const auditRef = orderRef.collection('auditEvents').doc(eventId);
+      transaction.set(auditRef, {
+        eventId,
+        orderId,
+        canteenId: orderData.canteenId,
+        eventType: `order_status_${nextStatus}`,
+        fromStatus: currentStatus,
+        toStatus: nextStatus,
+        actorUid: callerUid,
+        actorRole,
         reason: reason || (isStudentOwner ? 'Cancelled by student' : `Status updated to ${nextStatus}`),
         createdAt: serverTimestamp(),
       });
@@ -2113,6 +2196,488 @@ export const searchAdminOrder = functions.https.onCall(
         createdAt: d.createdAt,
         updatedAt: d.updatedAt,
       },
+    };
+  },
+);
+
+// ============================================================================
+// STEP 11: SERVICE DESK, ADMIN OPERATIONS, AND TOUCH-SCREEN KEYBOARD FOUNDATION
+// ============================================================================
+
+/**
+ * Callable Function: transitionOperationalOrderStatus (Step 11)
+ *
+ * Exposes order status transitions for service desk attendants and admins.
+ * Fully transactional, server-authoritative, idempotent, and updates immutable audit history.
+ */
+export const transitionOperationalOrderStatus = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    return await (transitionOrderStatus as any).run(data, context);
+  },
+);
+
+/**
+ * Callable Function: listOperationalOrders (Step 11)
+ *
+ * Retrieves incoming order queue for assigned canteens with strict role verification,
+ * bounded pagination (1..50), status filter, pickup date filter, and sanitized fields.
+ */
+export const listOperationalOrders = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    rejectUnknownFields(
+      data,
+      ['canteenId', 'status', 'pickupDate', 'limit', 'cursor'],
+      'listOperationalOrders',
+    );
+
+    // Verify caller has active operational privileges
+    const { role: callerRole, canteenIds } = await verifyOperationalAccess(
+      context,
+      data.canteenId ? validateId(data.canteenId, 'canteenId') : undefined,
+    );
+
+    // Limit validation: integer between 1 and 50
+    let limitCount = 20;
+    if (data.limit !== undefined && data.limit !== null) {
+      if (
+        typeof data.limit !== 'number' ||
+        !Number.isInteger(data.limit) ||
+        data.limit < 1 ||
+        data.limit > 50
+      ) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'limit must be an integer between 1 and 50.',
+        );
+      }
+      limitCount = data.limit;
+    }
+
+    let targetCanteen = data.canteenId ? validateId(data.canteenId, 'canteenId') : null;
+    if (!targetCanteen) {
+      if (canteenIds.length > 0) {
+        targetCanteen = canteenIds[0];
+      } else if (callerRole === 'platform_operator') {
+        targetCanteen = ALLOWED_CANTEEN_IDS[0];
+      }
+    }
+
+    if (!targetCanteen) {
+      return {
+        success: true,
+        count: 0,
+        orders: [],
+      };
+    }
+
+    let query: FirebaseFirestore.Query = db
+      .collection('orders')
+      .where('canteenId', '==', targetCanteen);
+
+    if (data.status) {
+      if (!VALID_ORDER_STATUSES.includes(data.status)) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          `Invalid status filter: ${data.status}.`,
+        );
+      }
+      query = query.where('status', '==', data.status);
+    }
+
+    if (data.pickupDate) {
+      if (typeof data.pickupDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(data.pickupDate)) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'pickupDate must be formatted as YYYY-MM-DD.',
+        );
+      }
+      query = query.where('pickupSlot.pickupDate', '==', data.pickupDate);
+    }
+
+    query = query.orderBy('createdAt', 'desc').limit(limitCount);
+
+    if (data.cursor && typeof data.cursor === 'string') {
+      const cursorDoc = await db.collection('orders').doc(data.cursor).get();
+      if (cursorDoc.exists) {
+        query = query.startAfter(cursorDoc);
+      }
+    }
+
+    const snapshot = await query.get();
+
+    const orders = snapshot.docs.map((doc) => {
+      const d = doc.data();
+      const rawUid = typeof d.studentUid === 'string' ? d.studentUid : '';
+      const maskedCustomer = rawUid ? `student_...${rawUid.slice(-4)}` : 'anonymous_student';
+
+      const itemCount = Array.isArray(d.itemsSnapshot)
+        ? d.itemsSnapshot.reduce(
+            (acc: number, item: any) =>
+              acc + (typeof item.quantity === 'number' ? item.quantity : 1),
+            0,
+          )
+        : 0;
+
+      return {
+        orderId: d.orderId || doc.id,
+        shortOrderReference: (d.orderId || doc.id).slice(0, 8).toUpperCase(),
+        canteenId: d.canteenId,
+        orderStatus: d.status,
+        status: d.status,
+        paymentStatus: d.paymentStatus || 'pending',
+        refundStatus: d.refundStatus || 'not_requested',
+        pickupSlot: d.pickupSlot || null,
+        itemCount,
+        totalInPaise: typeof d.totalInPaise === 'number' ? d.totalInPaise : 0,
+        maskedCustomer,
+        createdAt: d.createdAt || null,
+        updatedAt: d.updatedAt || null,
+        activePaymentId: d.activePaymentId ? String(d.activePaymentId).slice(0, 32) : null,
+      };
+    });
+
+    return {
+      success: true,
+      canteenId: targetCanteen,
+      count: orders.length,
+      orders,
+    };
+  },
+);
+
+/**
+ * Callable Function: searchOperationalOrders (Step 11)
+ *
+ * Performs bounded, sanitized order search by orderId or reference.
+ * Strictly isolates cross-canteen queries: nonexistent and unassigned canteen orders
+ * return a generic not-found result without leaking order existence.
+ */
+export const searchOperationalOrders = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    rejectUnknownFields(data, ['query', 'canteenId'], 'searchOperationalOrders');
+
+    if (!data.query || typeof data.query !== 'string') {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'query must be a non-empty string.',
+      );
+    }
+
+    const rawQuery = data.query.trim();
+    if (rawQuery.length < 1 || rawQuery.length > 64) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'query must be between 1 and 64 characters.',
+      );
+    }
+
+    // Reject control characters
+    if (/[\x00-\x1F\x7F]/.test(rawQuery)) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'query contains invalid control characters.',
+      );
+    }
+
+    const { role: callerRole, canteenIds } = await verifyOperationalAccess(
+      context,
+      data.canteenId ? validateId(data.canteenId, 'canteenId') : undefined,
+    );
+
+    // Direct lookup by document ID
+    let docSnap = await db.collection('orders').doc(rawQuery).get();
+
+    // If not found directly, try querying by orderId field
+    if (!docSnap.exists) {
+      const snap = await db
+        .collection('orders')
+        .where('orderId', '==', rawQuery)
+        .limit(1)
+        .get();
+      if (!snap.empty) {
+        docSnap = snap.docs[0];
+      }
+    }
+
+    // Generic not-found check: does not exist OR caller is not authorized for this order's canteen
+    if (!docSnap.exists) {
+      return {
+        success: true,
+        found: false,
+        order: null,
+      };
+    }
+
+    const d = docSnap.data()!;
+    const orderCanteenId = d.canteenId;
+
+    if (callerRole !== 'platform_operator' && !canteenIds.includes(orderCanteenId)) {
+      // Fail closed: return generic not found without revealing existence
+      return {
+        success: true,
+        found: false,
+        order: null,
+      };
+    }
+
+    if (data.canteenId && orderCanteenId !== data.canteenId) {
+      return {
+        success: true,
+        found: false,
+        order: null,
+      };
+    }
+
+    const rawUid = typeof d.studentUid === 'string' ? d.studentUid : '';
+    const maskedCustomer = rawUid ? `student_...${rawUid.slice(-4)}` : 'anonymous_student';
+
+    const itemCount = Array.isArray(d.itemsSnapshot)
+      ? d.itemsSnapshot.reduce(
+          (acc: number, item: any) =>
+            acc + (typeof item.quantity === 'number' ? item.quantity : 1),
+          0,
+        )
+      : 0;
+
+    return {
+      success: true,
+      found: true,
+      order: {
+        orderId: d.orderId || docSnap.id,
+        shortOrderReference: (d.orderId || docSnap.id).slice(0, 8).toUpperCase(),
+        canteenId: d.canteenId,
+        orderStatus: d.status,
+        status: d.status,
+        paymentStatus: d.paymentStatus || 'pending',
+        refundStatus: d.refundStatus || 'not_requested',
+        pickupSlot: d.pickupSlot || null,
+        itemsSnapshot: d.itemsSnapshot || [],
+        itemCount,
+        totalInPaise: typeof d.totalInPaise === 'number' ? d.totalInPaise : 0,
+        maskedCustomer,
+        createdAt: d.createdAt || null,
+        updatedAt: d.updatedAt || null,
+      },
+    };
+  },
+);
+
+/**
+ * Callable Function: getOperationalOrderDetails (Step 11)
+ *
+ * Retrieves sanitized operational order details including immutable audit history
+ * and operational notes. Generic not-found for unauthorized access.
+ */
+export const getOperationalOrderDetails = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    rejectUnknownFields(data, ['orderId'], 'getOperationalOrderDetails');
+
+    const orderId = validateId(data.orderId, 'orderId');
+    const { role: callerRole, canteenIds } = await verifyOperationalAccess(context);
+
+    const docSnap = await db.collection('orders').doc(orderId).get();
+    if (!docSnap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Order not found.');
+    }
+
+    const d = docSnap.data()!;
+    if (callerRole !== 'platform_operator' && !canteenIds.includes(d.canteenId)) {
+      // Generic not-found to prevent probing
+      throw new functions.https.HttpsError('not-found', 'Order not found.');
+    }
+
+    const rawUid = typeof d.studentUid === 'string' ? d.studentUid : '';
+    const maskedCustomer = rawUid ? `student_...${rawUid.slice(-4)}` : 'anonymous_student';
+
+    // Fetch operational notes
+    const notesSnap = await docSnap.ref.collection('operationalNotes').get();
+    const operationalNotes = notesSnap.docs
+      .map((doc) => doc.data())
+      .filter((n) => !n.isDeleted)
+      .sort((a, b) => {
+        const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+        const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+        return timeB - timeA;
+      })
+      .map((n) => ({
+        noteId: n.noteId,
+        orderId: n.orderId,
+        canteenId: n.canteenId,
+        authorUid: n.authorUid,
+        authorRole: n.authorRole,
+        body: n.body,
+        createdAt: n.createdAt,
+      }));
+
+    // Fetch audit events (and status history)
+    const auditSnap = await docSnap.ref.collection('auditEvents').get();
+    const statusHistorySnap = await docSnap.ref.collection('statusHistory').get();
+
+    const seenEventIds = new Set<string>();
+    const auditHistory: any[] = [];
+
+    auditSnap.docs.forEach((doc) => {
+      const ev = doc.data();
+      seenEventIds.add(ev.eventId || doc.id);
+      auditHistory.push({
+        eventId: ev.eventId || doc.id,
+        orderId: ev.orderId,
+        canteenId: ev.canteenId,
+        eventType: ev.eventType || 'status_change',
+        fromStatus: ev.fromStatus || null,
+        toStatus: ev.toStatus || null,
+        actorUid: ev.actorUid,
+        actorRole: ev.actorRole,
+        reason: ev.reason || null,
+        createdAt: ev.createdAt,
+      });
+    });
+
+    statusHistorySnap.docs.forEach((doc) => {
+      const sh = doc.data();
+      const eid = sh.eventId || doc.id;
+      if (!seenEventIds.has(eid)) {
+        seenEventIds.add(eid);
+        auditHistory.push({
+          eventId: eid,
+          orderId: sh.orderId,
+          canteenId: sh.canteenId,
+          eventType: `order_status_${sh.toStatus}`,
+          fromStatus: sh.fromStatus || null,
+          toStatus: sh.toStatus || null,
+          actorUid: sh.actorUid,
+          actorRole: sh.actorRole,
+          reason: sh.reason || null,
+          createdAt: sh.createdAt,
+        });
+      }
+    });
+
+    auditHistory.sort((a, b) => {
+      const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+      const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+      return timeA - timeB;
+    });
+
+    return {
+      success: true,
+      order: {
+        orderId: d.orderId || docSnap.id,
+        shortOrderReference: (d.orderId || docSnap.id).slice(0, 8).toUpperCase(),
+        canteenId: d.canteenId,
+        orderStatus: d.status,
+        status: d.status,
+        paymentStatus: d.paymentStatus || 'pending',
+        paymentMethod: d.paymentMethod,
+        refundStatus: d.refundStatus || 'not_requested',
+        pickupSlot: d.pickupSlot || null,
+        itemsSnapshot: d.itemsSnapshot || [],
+        totalInPaise: typeof d.totalInPaise === 'number' ? d.totalInPaise : 0,
+        maskedCustomer,
+        createdAt: d.createdAt || null,
+        updatedAt: d.updatedAt || null,
+        operationalNotes,
+        auditHistory,
+      },
+    };
+  },
+);
+
+/**
+ * Callable Function: createOperationalNote (Step 11)
+ *
+ * Adds an operational note to an order. Author UID and role are derived server-side.
+ * Appends an audit event to the order's immutable audit history.
+ */
+export const createOperationalNote = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    rejectUnknownFields(data, ['orderId', 'body'], 'createOperationalNote');
+
+    const orderId = validateId(data.orderId, 'orderId');
+
+    if (!data.body || typeof data.body !== 'string') {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'body must be a non-empty string.',
+      );
+    }
+
+    const trimmedBody = data.body.trim();
+    if (trimmedBody.length < 1 || trimmedBody.length > 1000) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'body must be between 1 and 1000 characters.',
+      );
+    }
+
+    // Reject control characters (allowing regular newline and space)
+    if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(trimmedBody)) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'Note contains invalid control characters.',
+      );
+    }
+
+    // Verify operational privileges
+    const { uid: authorUid, role: callerRole, canteenIds } = await verifyOperationalAccess(
+      context,
+      undefined,
+      ['platform_operator', 'canteen_admin', 'service_desk'],
+    );
+
+    const authorRole: 'canteen_admin' | 'service_desk' =
+      callerRole === 'service_desk' ? 'service_desk' : 'canteen_admin';
+
+    const orderRef = db.collection('orders').doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Order not found.');
+    }
+
+    const orderData = orderSnap.data()!;
+    if (callerRole !== 'platform_operator' && !canteenIds.includes(orderData.canteenId)) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        `Caller is not authorized for canteen ${orderData.canteenId}.`,
+      );
+    }
+
+    const noteId = `note_${crypto.randomUUID()}`;
+    const noteRef = orderRef.collection('operationalNotes').doc(noteId);
+    const auditEventId = `${orderId}_note_${noteId}`;
+    const auditRef = orderRef.collection('auditEvents').doc(auditEventId);
+
+    const batch = db.batch();
+
+    batch.set(noteRef, {
+      noteId,
+      orderId,
+      canteenId: orderData.canteenId,
+      authorUid,
+      authorRole,
+      body: trimmedBody,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      isDeleted: false,
+    });
+
+    batch.set(auditRef, {
+      eventId: auditEventId,
+      orderId,
+      canteenId: orderData.canteenId,
+      eventType: 'operational_note_created',
+      actorUid: authorUid,
+      actorRole: authorRole,
+      reason: 'Operational note added',
+      createdAt: serverTimestamp(),
+    });
+
+    await batch.commit();
+
+    return {
+      success: true,
+      noteId,
+      orderId,
     };
   },
 );

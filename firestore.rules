@@ -228,6 +228,22 @@ service cloud.firestore {
       match /webhookEvents/{eventId} {
         allow read, write: if false; // Server-only
       }
+
+      // ----------------------------------------------------------------------
+      // Operational Notes Subcollection (Step 11 — Server Callable Only)
+      // orders/{orderId}/operationalNotes/{noteId}
+      // ----------------------------------------------------------------------
+      match /operationalNotes/{noteId} {
+        allow read, write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Audit Events Subcollection (Step 11 — Server Callable Only, Append-Only)
+      // orders/{orderId}/auditEvents/{eventId}
+      // ----------------------------------------------------------------------
+      match /auditEvents/{eventId} {
+        allow read, write: if false;
+      }
     }
 
     // ------------------------------------------------------------------------
