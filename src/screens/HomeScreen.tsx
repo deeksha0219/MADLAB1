@@ -5,11 +5,11 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import MaterialIcon from "react-native-vector-icons/MaterialIcons";
-import FeatherIcon from "react-native-vector-icons/Feather";
 import { home as Homestyles } from "../styles/Studentstyles";
 import { useNavigation } from "@react-navigation/native";
 import firestore from "@react-native-firebase/firestore";
 import { getActiveCanteens, Canteen } from "../services/catalogService";
+import NotificationBell from "../components/NotificationBell";
 
 export default function HomeScreen() {
   const navigation = useNavigation<any>();
@@ -208,7 +208,7 @@ export default function HomeScreen() {
               style={Homestyles.logoCenter}
             />
 
-            <FeatherIcon name="bell" size={30} color="black" />
+            <NotificationBell color="black" size={28} />
           </View>
 
           {/* ✅ CANTEEN DROPDOWN MODAL */}

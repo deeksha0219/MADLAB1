@@ -19,6 +19,7 @@ import MMAdminCategoryScreen from "../screens/MMAdminCategoryScreen";
 import MMLibraryCategoryScreen from "../screens/MMLibraryCategoryScreen";
 import AdminLandingScreen from "../screens/AdminLandingScreen";
 import AccessDeniedScreen from "../screens/AccessDeniedScreen";
+import NotificationsScreen from "../screens/NotificationsScreen";
 
 import { getStudentProfile, StudentProfile } from "../services/profileService";
 import { getAdminProfile, AdminProfile } from "../services/adminService";
@@ -121,11 +122,14 @@ export default function AppNavigator() {
           </Stack.Screen>
         ) : adminProfile ? (
           /* AUTHENTICATED ADMIN STATE */
-          <Stack.Screen name="AdminLanding">
-            {(props) => (
-              <AdminLandingScreen {...props} adminProfile={adminProfile} />
-            )}
-          </Stack.Screen>
+          <>
+            <Stack.Screen name="AdminLanding">
+              {(props) => (
+                <AdminLandingScreen {...props} adminProfile={adminProfile} />
+              )}
+            </Stack.Screen>
+            <Stack.Screen name="Notifications" component={NotificationsScreen} />
+          </>
         ) : !studentProfile ? (
           /* AUTHENTICATED BUT PROFILE INCOMPLETE -> Complete registration */
           <Stack.Screen name="CompleteProfile">
@@ -147,6 +151,7 @@ export default function AppNavigator() {
             <Stack.Screen name="MMLibraryCategory" component={MMLibraryCategoryScreen} />
             <Stack.Screen name="MMAdminBlock" component={MMAdminBlockScreen} />
             <Stack.Screen name="MMLibrary" component={MMLibraryScreen} />
+            <Stack.Screen name="Notifications" component={NotificationsScreen} />
           </>
         )}
       </Stack.Navigator>

@@ -83,6 +83,23 @@ service cloud.firestore {
       match /paymentRequests/{idempotencyKey} {
         allow read, write: if false; // Server-only via Cloud Functions
       }
+
+      // ----------------------------------------------------------------------
+      // In-App Notifications (Step 10): users/{userId}/notifications/{notificationId}
+      // Mandatory Access Policy: Callable-Only Access.
+      // All notification reads and writes must go through trusted Cloud Functions.
+      // Direct client reads and writes are strictly denied.
+      // ----------------------------------------------------------------------
+      match /notifications/{notificationId} {
+        allow read, write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Server-Only Outbox: users/{userId}/notificationOutbox/{eventId}
+      // ----------------------------------------------------------------------
+      match /notificationOutbox/{eventId} {
+        allow read, write: if false;
+      }
     }
 
     // ------------------------------------------------------------------------
@@ -217,6 +234,13 @@ service cloud.firestore {
     // Webhook Events Collection (Top-Level Step 9 Deduplication)
     // ------------------------------------------------------------------------
     match /webhookEvents/{document=**} {
+      allow read, write: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Notification Events Collection (Step 10 Server-Only Events)
+    // ------------------------------------------------------------------------
+    match /notificationEvents/{eventId} {
       allow read, write: if false;
     }
 

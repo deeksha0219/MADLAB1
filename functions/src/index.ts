@@ -15,6 +15,10 @@
 import * as functions from 'firebase-functions/v1';
 import * as admin from 'firebase-admin';
 import * as crypto from 'crypto';
+import {
+  createNotificationInternal,
+  notifyAssignedCanteenAdmins,
+} from './notifications/notificationService';
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -1378,6 +1382,36 @@ export const createOrder = functions.https.onCall(
       };
     });
 
+    // Step 10: Emit in-app notifications after transaction commits (non-blocking, fail-safe).
+    // Notifications do not alter order, payment, refund, or capacity state.
+    if (!result.isRetry) {
+      const { orderId: newOrderId, studentUid: newStudentUid, canteenId: newCanteenId } = {
+        orderId: result.orderId,
+        studentUid,
+        canteenId,
+      };
+      const sourceEventId = `${newOrderId}_placed`;
+      createNotificationInternal({
+        sourceEventId,
+        sourceEventType: 'order',
+        recipientUid: newStudentUid,
+        type: 'order_placed',
+        orderId: newOrderId,
+        canteenId: newCanteenId,
+      }).catch((err) =>
+        functions.logger.warn('[Step10] order_placed student notification failed (non-fatal):', err?.message),
+      );
+      notifyAssignedCanteenAdmins({
+        canteenId: newCanteenId,
+        type: 'new_order_for_admin',
+        orderId: newOrderId,
+        sourceEventId,
+        sourceEventType: 'order',
+      }).catch((err) =>
+        functions.logger.warn('[Step10] new_order_for_admin notification failed (non-fatal):', err?.message),
+      );
+    }
+
     return {
       success: true,
       ...result,
@@ -1782,10 +1816,79 @@ export const transitionOrderStatus = functions.https.onCall(
         status: nextStatus,
         paymentStatus: currentPaymentStatus,
         refundStatus: isRefundInitiated ? 'pending' : (orderData.refundStatus || 'not_requested'),
+        _notifMeta: {
+          studentUid: orderData.studentUid,
+          canteenId: orderData.canteenId,
+          nextStatus,
+          isRefundInitiated,
+          activePaidPaymentId: activePaidPaymentSnap?.id,
+        },
       };
+    }).then(async (result) => {
+      // Step 10: Emit status-change notification (fire-and-forget, never alters order state)
+      if (!result.isIdempotent && result.fromStatus !== result.status) {
+        const { studentUid: sUid, canteenId: cId, nextStatus: ns, isRefundInitiated: isRefInit, activePaidPaymentId: payId } = (result as any)._notifMeta || {};
+        if (sUid && ns) {
+          _dispatchTransitionNotification(orderId, sUid, cId, result.fromStatus, ns);
+          if (isRefInit && payId) {
+            try {
+              await createNotificationInternal({
+                sourceEventId: `${payId}_refund_pending`,
+                sourceEventType: 'refund',
+                recipientUid: sUid,
+                recipientRole: 'student',
+                type: 'refund_pending_demo',
+                orderId,
+                canteenId: cId,
+              });
+            } catch (err: any) {
+              functions.logger.warn('[Step10] auto-refund notification failed (non-fatal):', err?.message);
+            }
+          }
+        }
+      }
+      const { _notifMeta: _m, ...publicResult } = result as any;
+      return publicResult;
     });
   },
 );
+
+// Step 10 — Notification dispatch wrapper for transitionOrderStatus
+// Defined immediately after the export so it can access the result after the function executes.
+// This is a fire-and-forget side effect; it never modifies order/payment/refund state.
+const _dispatchTransitionNotification = (
+  orderId: string,
+  studentUid: string,
+  canteenId: string,
+  fromStatus: string | undefined,
+  nextStatus: string,
+): void => {
+  const STATUS_TO_NOTIFICATION_TYPE: Record<string, import('./notifications/notificationService').StudentNotificationType | null> = {
+    accepted: 'order_accepted',
+    preparing: 'order_preparing',
+    ready_for_pickup: 'order_ready_for_pickup',
+    completed: 'order_completed',
+    cancelled: 'order_cancelled',
+    rejected: 'order_rejected',
+  };
+  const notifType = STATUS_TO_NOTIFICATION_TYPE[nextStatus];
+  if (notifType && studentUid) {
+    const sourceEventId = fromStatus
+      ? `${orderId}_${fromStatus}_to_${nextStatus}`
+      : `${orderId}_to_${nextStatus}`;
+    createNotificationInternal({
+      sourceEventId,
+      sourceEventType: 'order',
+      recipientUid: studentUid,
+      recipientRole: 'student',
+      type: notifType,
+      orderId,
+      canteenId,
+    }).catch((err) =>
+      functions.logger.warn(`[Step10] ${notifType} notification failed (non-fatal):`, err?.message),
+    );
+  }
+};
 
 /**
  * Callable Function: verifyDemoPayment (Step 8 — Emulator-Only Demo Behavior)
@@ -2648,7 +2751,39 @@ export const completeDemoPayment = functions.https.onCall(
         paymentId,
         status: 'succeeded_demo',
         orderStatus: 'payment_verified',
+        _notifMeta: {
+          studentUid: orderData.studentUid,
+          canteenId: orderData.canteenId,
+        },
       };
+    }).then((result) => {
+      // Step 10: Emit in-app notifications after transaction commits
+      if (!result.isRetry) {
+        const { studentUid: sUid, canteenId: cId } = (result as any)._notifMeta || {};
+        if (sUid) {
+          createNotificationInternal({
+            sourceEventId: `${paymentId}_succeeded_demo`,
+            sourceEventType: 'payment',
+            recipientUid: sUid,
+            type: 'payment_succeeded_demo',
+            orderId,
+            canteenId: cId,
+          }).catch((err) =>
+            functions.logger.warn('[Step10] payment_succeeded_demo notification failed (non-fatal):', err?.message),
+          );
+          notifyAssignedCanteenAdmins({
+            canteenId: cId,
+            type: 'payment_verified_for_admin',
+            orderId,
+            sourceEventId: `${paymentId}_succeeded_demo`,
+            sourceEventType: 'payment',
+          }).catch((err) =>
+            functions.logger.warn('[Step10] payment_verified_for_admin notification failed (non-fatal):', err?.message),
+          );
+        }
+      }
+      const { _notifMeta: _m, ...publicResult } = result as any;
+      return publicResult;
     });
   },
 );
@@ -2787,7 +2922,27 @@ export const failDemoPayment = functions.https.onCall(
         status: 'failed',
         failureCode,
         failureMessage,
+        _notifMeta: { studentUid: orderData.studentUid, canteenId: orderData.canteenId },
       };
+    }).then((result) => {
+      // Step 10: Emit payment_failed notification
+      if (!result.isRetry) {
+        const { studentUid: sUid, canteenId: cId } = (result as any)._notifMeta || {};
+        if (sUid) {
+          createNotificationInternal({
+            sourceEventId: `${paymentId}_failed`,
+            sourceEventType: 'payment',
+            recipientUid: sUid,
+            type: 'payment_failed',
+            orderId,
+            canteenId: cId,
+          }).catch((err) =>
+            functions.logger.warn('[Step10] payment_failed notification failed (non-fatal):', err?.message),
+          );
+        }
+      }
+      const { _notifMeta: _m, ...publicResult } = result as any;
+      return publicResult;
     });
   },
 );
@@ -3220,6 +3375,7 @@ export const requestDemoRefund = functions.https.onCall(
           paymentId,
           refundStatus: 'pending',
           refundReference: ref,
+          _notifMeta: { studentUid: orderData.studentUid, canteenId: orderData.canteenId },
         };
       }
       if (paymentData.refundStatus === 'succeeded_demo') {
@@ -3229,6 +3385,7 @@ export const requestDemoRefund = functions.https.onCall(
           orderId,
           paymentId,
           refundStatus: 'succeeded_demo',
+          _notifMeta: { studentUid: orderData.studentUid, canteenId: orderData.canteenId },
         };
       }
 
@@ -3279,7 +3436,28 @@ export const requestDemoRefund = functions.https.onCall(
         paymentId,
         refundStatus: 'pending',
         refundReference,
+        _notifMeta: { studentUid: orderData.studentUid, canteenId: orderData.canteenId },
       };
+    }).then(async (result) => {
+      // Step 10: Emit refund_pending_demo notification (createNotificationInternal is idempotent)
+      const { studentUid: sUid, canteenId: cId } = (result as any)._notifMeta || {};
+      if (sUid) {
+        try {
+          await createNotificationInternal({
+            sourceEventId: `${paymentId}_refund_pending`,
+            sourceEventType: 'refund',
+            recipientUid: sUid,
+            recipientRole: 'student',
+            type: 'refund_pending_demo',
+            orderId,
+            canteenId: cId,
+          });
+        } catch (err: any) {
+          functions.logger.warn('[Step10] refund_pending_demo notification failed (non-fatal):', err?.message);
+        }
+      }
+      const { _notifMeta: _m, ...publicResult } = result as any;
+      return publicResult;
     });
   },
 );
@@ -3355,6 +3533,7 @@ export const completeDemoRefund = functions.https.onCall(
           paymentId,
           refundStatus: 'succeeded_demo',
           refundedAmountInPaise: paymentData.refundedAmountInPaise,
+          _notifMeta: { studentUid: orderData.studentUid, canteenId: orderData.canteenId },
         };
       }
 
@@ -3406,7 +3585,28 @@ export const completeDemoRefund = functions.https.onCall(
         paymentId,
         refundStatus: 'succeeded_demo',
         refundedAmountInPaise,
+        _notifMeta: { studentUid: orderData.studentUid, canteenId: orderData.canteenId },
       };
+    }).then(async (result) => {
+      // Step 10: Emit refund_completed_demo notification
+      const { studentUid: sUid, canteenId: cId } = (result as any)._notifMeta || {};
+      if (sUid) {
+        try {
+          await createNotificationInternal({
+            sourceEventId: `${paymentId}_refunded_demo`,
+            sourceEventType: 'refund',
+            recipientUid: sUid,
+            recipientRole: 'student',
+            type: 'refund_completed_demo',
+            orderId,
+            canteenId: cId,
+          });
+        } catch (err: any) {
+          functions.logger.warn('[Step10] refund_completed_demo notification failed (non-fatal):', err?.message);
+        }
+      }
+      const { _notifMeta: _m, ...publicResult } = result as any;
+      return publicResult;
     });
   },
 );
@@ -3567,6 +3767,12 @@ export const verifySyntheticWebhook = functions.https.onRequest(
               'invalid-argument',
               `Amount mismatch. Server expected ${paymentData.amountInPaise}, Webhook: ${amountInPaise}.`,
             );
+          }
+
+          // Idempotency: if already succeeded, succeed idempotently
+          if (paymentData.status === 'succeeded_demo') {
+            isReplay = true;
+            return;
           }
 
           if (paymentData.status !== 'processing') {
@@ -3760,6 +3966,53 @@ export const verifySyntheticWebhook = functions.https.onRequest(
         isIdempotent: isReplay,
         processedEventId: eventId,
       });
+
+      // Step 10: Emit in-app notifications for webhook-triggered events (fire-and-forget, non-blocking)
+      if (!isReplay) {
+        // Re-read order data for notification routing (lightweight, separate from the committed transaction)
+        db.collection('orders').doc(orderId).get().then((orderSnap) => {
+          if (!orderSnap.exists) return;
+          const od = orderSnap.data()!;
+          if (eventType === 'payment.captured' || eventType === 'payment.succeeded') {
+            createNotificationInternal({
+              sourceEventId: `${paymentId}_succeeded_demo`,
+              sourceEventType: 'payment',
+              recipientUid: od.studentUid,
+              recipientRole: 'student',
+              type: 'payment_succeeded_demo',
+              orderId,
+              canteenId: od.canteenId,
+            }).catch(() => {});
+            notifyAssignedCanteenAdmins({
+              canteenId: od.canteenId,
+              type: 'payment_verified_for_admin',
+              orderId,
+              sourceEventId: `${paymentId}_succeeded_demo`,
+              sourceEventType: 'payment',
+            }).catch(() => {});
+          } else if (eventType === 'payment.failed') {
+            createNotificationInternal({
+              sourceEventId: `${paymentId}_failed`,
+              sourceEventType: 'payment',
+              recipientUid: od.studentUid,
+              recipientRole: 'student',
+              type: 'payment_failed',
+              orderId,
+              canteenId: od.canteenId,
+            }).catch(() => {});
+          } else if (eventType === 'refund.processed') {
+            createNotificationInternal({
+              sourceEventId: `${paymentId}_refunded_demo`,
+              sourceEventType: 'refund',
+              recipientUid: od.studentUid,
+              recipientRole: 'student',
+              type: 'refund_completed_demo',
+              orderId,
+              canteenId: od.canteenId,
+            }).catch(() => {});
+          }
+        }).catch(() => {});
+      }
     } catch (err: any) {
       if (err instanceof functions.https.HttpsError) {
         const statusCode =
@@ -3769,5 +4022,311 @@ export const verifySyntheticWebhook = functions.https.onRequest(
       }
       res.status(500).json({ error: 'Internal webhook processing error.' });
     }
+  },
+);
+
+// ============================================================================
+// STEP 10: IN-APP NOTIFICATION CALLABLE FUNCTIONS
+// All notification reads and mutations are brokered exclusively via these
+// authenticated callable functions. No direct client Firestore reads or writes
+// to users/{userId}/notifications are permitted.
+// ============================================================================
+
+/**
+ * Callable: listMyNotifications
+ *
+ * Returns paginated, ordered list of in-app notifications for the authenticated user.
+ * - Derives UID from context.auth.uid (never from client payload)
+ * - Accepts only: { limit?, startAfterCreatedAt? }
+ * - limit: 1–50, default 20
+ * - Returns sanitized DTOs; never returns raw Firestore documents
+ */
+export const listMyNotifications = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    // 1. Authentication
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required to list notifications.',
+      );
+    }
+    const recipientUid = context.auth.uid;
+
+    // 2. Strict input allowlist
+    rejectUnknownFields(
+      data,
+      ['limit', 'cursor'],
+      'listMyNotifications',
+    );
+
+    // 3. Validate limit: integer 1–50, default 20
+    let limit = 20;
+    if (data.limit !== undefined) {
+      if (
+        typeof data.limit !== 'number' ||
+        !Number.isInteger(data.limit) ||
+        data.limit < 1 ||
+        data.limit > 50
+      ) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'limit must be an integer between 1 and 50.',
+        );
+      }
+      limit = data.limit;
+    }
+
+    // 4. Query notifications ordered by createdAt desc, bounded by limit
+    let query = db
+      .collection('users')
+      .doc(recipientUid)
+      .collection('notifications')
+      .orderBy('createdAt', 'desc')
+      .limit(limit);
+
+    if (data.cursor !== undefined) {
+      if (
+        typeof data.cursor !== 'string' ||
+        !/^notif_[a-f0-9]{32}$/.test(data.cursor)
+      ) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'cursor must be a valid notification ID.',
+        );
+      }
+      const cursorDoc = await db
+        .collection('users')
+        .doc(recipientUid)
+        .collection('notifications')
+        .doc(data.cursor)
+        .get();
+
+      if (!cursorDoc.exists) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'cursor document does not exist.',
+        );
+      }
+      query = query.startAfter(cursorDoc);
+    }
+
+    const snap = await query.get();
+
+    // 5. Build sanitized DTOs — never return raw internal fields
+    const notifications = snap.docs.map((doc) => {
+      const d = doc.data();
+      return {
+        notificationId: d.notificationId,
+        recipientRole: d.recipientRole || 'student',
+        type: d.type,
+        title: d.title,
+        body: d.body,
+        isRead: d.isRead === true,
+        orderId: d.orderId,
+        createdAt: d.createdAt,
+        readAt: d.readAt || null,
+      };
+    });
+
+    const hasMore = snap.docs.length === limit;
+    const nextCursor = hasMore ? snap.docs[snap.docs.length - 1].id : null;
+
+    return {
+      success: true,
+      notifications,
+      count: notifications.length,
+      hasMore,
+      nextCursor,
+    };
+  },
+);
+
+/**
+ * Callable: markNotificationRead
+ *
+ * Marks a single notification as read.
+ * - Caller must own the notification (recipientUid === context.auth.uid)
+ * - Accepts only: { notificationId }
+ * - Updates only isRead and readAt — no other fields are modified
+ * - Idempotent: already-read notifications return success
+ */
+export const markNotificationRead = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    // 1. Authentication
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required.',
+      );
+    }
+    const recipientUid = context.auth.uid;
+
+    // 2. Strict input allowlist
+    rejectUnknownFields(data, ['notificationId'], 'markNotificationRead');
+
+    // 3. Validate notificationId
+    if (
+      typeof data.notificationId !== 'string' ||
+      !/^notif_[a-f0-9]{32}$/.test(data.notificationId)
+    ) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'notificationId must be a valid notification ID.',
+      );
+    }
+    const notificationId = data.notificationId;
+
+    // 4. Fetch notification (path is already scoped to this user)
+    const notifRef = db
+      .collection('users')
+      .doc(recipientUid)
+      .collection('notifications')
+      .doc(notificationId);
+
+    const notifSnap = await notifRef.get();
+    if (!notifSnap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Notification not found.');
+    }
+    const notifData = notifSnap.data()!;
+
+    // 5. Ownership verification (defense-in-depth — path already scoped by uid)
+    if (notifData.recipientUid !== recipientUid) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'Not authorized to modify this notification.',
+      );
+    }
+
+    // 6. Idempotent: already read
+    if (notifData.isRead === true) {
+      return { success: true, isIdempotent: true, notificationId };
+    }
+
+    // 7. Update ONLY isRead and readAt — never modify type, title, body, orderId, or createdAt
+    await notifRef.update({
+      isRead: true,
+      readAt: serverTimestamp(),
+    });
+
+    return { success: true, isIdempotent: false, notificationId };
+  },
+);
+
+/**
+ * Callable: markAllNotificationsRead
+ *
+ * Marks all unread notifications as read for the authenticated caller.
+ * - Accepts only: {} or { cursor }
+ * - Uses bounded batches of at most 500 notifications per call
+ * - Updates ONLY isRead and readAt
+ * - Idempotent: safe to call multiple times
+ */
+export const markAllNotificationsRead = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    // 1. Authentication
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required.',
+      );
+    }
+    const recipientUid = context.auth.uid;
+
+    // 2. Strict input allowlist — empty payload or optional cursor
+    rejectUnknownFields(data, ['cursor'], 'markAllNotificationsRead');
+
+    // 3. Query unread notifications bounded by batch limit of 500
+    let query = db
+      .collection('users')
+      .doc(recipientUid)
+      .collection('notifications')
+      .where('isRead', '==', false)
+      .orderBy('createdAt', 'desc')
+      .limit(500);
+
+    if (data.cursor !== undefined) {
+      if (
+        typeof data.cursor !== 'string' ||
+        !/^notif_[a-f0-9]{32}$/.test(data.cursor)
+      ) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'cursor must be a valid notification ID.',
+        );
+      }
+      const cursorDoc = await db
+        .collection('users')
+        .doc(recipientUid)
+        .collection('notifications')
+        .doc(data.cursor)
+        .get();
+
+      if (cursorDoc.exists) {
+        const cData = cursorDoc.data();
+        if (cData?.createdAt) {
+          query = query.startAfter(cData.createdAt);
+        } else {
+          query = query.startAfter(cursorDoc);
+        }
+      }
+    }
+
+    const unreadSnap = await query.get();
+
+    if (unreadSnap.empty) {
+      return { success: true, updatedCount: 0, hasMore: false, nextCursor: null };
+    }
+
+    // 4. Batch update — bounded to at most 500 writes
+    const batch = db.batch();
+    const now = serverTimestamp();
+
+    unreadSnap.docs.forEach((doc) => {
+      batch.update(doc.ref, { isRead: true, readAt: now });
+    });
+
+    await batch.commit();
+
+    const hasMore = unreadSnap.docs.length === 500;
+    const nextCursor = hasMore ? unreadSnap.docs[unreadSnap.docs.length - 1].id : null;
+
+    return {
+      success: true,
+      updatedCount: unreadSnap.docs.length,
+      hasMore,
+      nextCursor,
+    };
+  },
+);
+
+/**
+ * Callable: getUnreadNotificationCount
+ *
+ * Returns the count of unread notifications for the authenticated caller.
+ * - Accepts only: {} (empty payload)
+ */
+export const getUnreadNotificationCount = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    // 1. Authentication
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required.',
+      );
+    }
+    const recipientUid = context.auth.uid;
+
+    // 2. Strict input allowlist — empty payload only
+    rejectUnknownFields(data, [], 'getUnreadNotificationCount');
+
+    // 3. Count unread
+    const snap = await db
+      .collection('users')
+      .doc(recipientUid)
+      .collection('notifications')
+      .where('isRead', '==', false)
+      .get();
+
+    return { success: true, unreadCount: snap.size };
   },
 );

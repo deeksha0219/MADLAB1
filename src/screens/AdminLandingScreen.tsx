@@ -31,6 +31,7 @@ import {
   transitionOrderStatusCallable,
   verifyDemoPaymentCallable,
 } from '../services/orderService';
+import NotificationBell from '../components/NotificationBell';
 
 type Props = {
   adminProfile: AdminProfile;
@@ -340,9 +341,12 @@ export default function AdminLandingScreen({ adminProfile }: Props) {
       <View style={styles.header}>
         <View style={styles.headerTop}>
           <Text style={styles.title}>Admin Console</Text>
-          <TouchableOpacity style={styles.signOutSmall} onPress={handleSignOut}>
-            <Text style={styles.signOutSmallText}>Sign Out</Text>
-          </TouchableOpacity>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+            <NotificationBell color="#fff" size={26} />
+            <TouchableOpacity style={styles.signOutSmall} onPress={handleSignOut}>
+              <Text style={styles.signOutSmallText}>Sign Out</Text>
+            </TouchableOpacity>
+          </View>
         </View>
         <Text style={styles.subtitle}>Protected Canteen Order Operations</Text>
       </View>
