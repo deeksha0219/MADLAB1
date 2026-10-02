@@ -11,10 +11,9 @@ on:
       - main
 
 jobs:
-  validate:
-    name: Foundation & Environment Validation
+  static-and-unit:
+    name: Static Analysis, Secrets Scan & Unit Tests
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -25,7 +24,7 @@ jobs:
           node-version: 22
           cache: 'npm'
 
-      - name: Verify No Secrets Committed (Recursive Scan)
+      - name: Verify No Secrets, Keystores or Local Properties Committed
         run: |
           node -e "
             const fs = require('fs');
@@ -43,13 +42,14 @@ jobs:
                   }
                 } else if (entry.isFile()) {
                   const name = entry.name;
-                  // Secret file checks
                   const isEnvSecret = /^\.env(\.|$)/i.test(name) && !name.endsWith('.example');
                   const isServiceAccount = /serviceAccount.*\.json$/i.test(name);
                   const isAdminSdk = /.*-adminsdk-.*\.json$/i.test(name);
                   const isCert = /\.(pem|key)$/i.test(name);
+                  const isKeystore = /(debug\.keystore|.*\.jks|.*\.keystore)$/i.test(name);
+                  const isLocalProps = name === 'local.properties';
 
-                  if (isEnvSecret || isServiceAccount || isAdminSdk || isCert) {
+                  if (isEnvSecret || isServiceAccount || isAdminSdk || isCert || isKeystore || isLocalProps) {
                     forbiddenFiles.push(path.join(dir, name));
                   }
                 }
@@ -59,18 +59,44 @@ jobs:
             scan('.');
 
             if (forbiddenFiles.length > 0) {
-              console.error('::error::Forbidden sensitive files detected in repository:');
+              console.error('::error::Forbidden sensitive/local files detected in repository:');
               forbiddenFiles.forEach(f => console.error('  - ' + f));
               process.exit(1);
             }
 
-            console.log('Secret scan passed: zero sensitive files detected.');
+            console.log('Secret and credential scan passed: zero sensitive files detected.');
           "
 
-      - name: Install Dependencies (Exact via lockfile)
+      - name: Verify Firebase Configuration & Release Invariants
+        run: |
+          node -e "
+            const fs = require('fs');
+            const rc = JSON.parse(fs.readFileSync('.firebaserc', 'utf8'));
+            if (rc.projects.default !== 'demo-grabngo-local') {
+              console.error('Default alias must remain demo-grabngo-local to prevent accidental cloud deployment');
+              process.exit(1);
+            }
+            if (rc.projects.staging !== 'mad-lab-a9665') {
+              console.error('Staging alias must be mad-lab-a9665');
+              process.exit(1);
+            }
+            if (rc.projects.production) {
+              console.error('Production alias must NOT be configured in local CI');
+              process.exit(1);
+            }
+
+            const envSrc = fs.readFileSync('src/config/environment.ts', 'utf8');
+            if (envSrc.includes('PRODUCTION_CONFIG') && envSrc.includes('useEmulator: true')) {
+              console.error('Emulator must never be enabled in PRODUCTION_CONFIG');
+              process.exit(1);
+            }
+            console.log('Firebase project aliases and release invariants verified.');
+          "
+
+      - name: Install Client Dependencies
         run: npm ci
 
-      - name: TypeScript Typecheck (No-Emit)
+      - name: TypeScript Typecheck
         run: npm run typecheck
 
       - name: ESLint Check
@@ -79,22 +105,115 @@ jobs:
       - name: Jest Test Suite
         run: npm test -- --runInBand
 
-      - name: Validate Firebase Configuration
+      - name: Install Functions Dependencies
+        run: npm --prefix functions ci
+
+      - name: Build Firebase Functions
+        run: npm --prefix functions run build
+
+      - name: Verify Functions Build Output
+        run: |
+          test -f functions/lib/index.js || { echo "functions/lib/index.js missing"; exit 1; }
+          test -f functions/lib/notifications/notificationWorker.js || { echo "notificationWorker.js missing"; exit 1; }
+          test -f functions/lib/slots/slotSharding.js || { echo "slotSharding.js missing"; exit 1; }
+          echo "Functions build outputs verified successfully."
+
+  emulator-matrix:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    needs: static-and-unit
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Firestore Security Rules Emulator Tests
+            command: npm run test:rules:emulator
+            suite: rules
+          - name: Functions Emulator Tests (Catalog & Auth)
+            command: npm run test:functions:emulator
+            suite: functions
+          - name: Order & Cart Lifecycle Emulator Tests
+            command: npm run test:order:emulator
+            suite: order
+          - name: Order Status Transitions Emulator Tests
+            command: npm run test:status:emulator
+            suite: status
+          - name: Payment & Synthetic Webhook Emulator Tests
+            command: npm run test:payment:emulator
+            suite: payment
+          - name: Notification Outbox Worker Emulator Tests
+            command: npm run test:notifications:emulator
+            suite: notifications
+          - name: Service Desk & Kiosk Emulator Tests
+            command: npm run test:service-desk:emulator
+            suite: service-desk
+          - name: Sharded Slot Capacity Emulator Tests
+            command: npm run test:sharded-slot:emulator
+            suite: sharded-slot
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java Runtime (Temurin 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: |
+          npm ci
+          npm --prefix functions ci
+          npm --prefix functions run build
+
+      - name: Run ${{ matrix.name }}
+        run: ${{ matrix.command }}
+
+  ci-summary:
+    name: CI Verification Summary & Gate
+    runs-on: ubuntu-latest
+    needs: [static-and-unit, emulator-matrix]
+    if: always()
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Evaluate Gates and Emit Summary Artifact
         run: |
           node -e "
             const fs = require('fs');
-            const rc = JSON.parse(fs.readFileSync('.firebaserc', 'utf8'));
-            if (rc.projects.default !== 'demo-grabngo-local') {
-              console.error('Default alias must be demo-grabngo-local to prevent accidental deploy');
+            const staticResult = '${{ needs.static-and-unit.result }}';
+            const emulatorResult = '${{ needs.emulator-matrix.result }}';
+            const passed = staticResult === 'success' && emulatorResult === 'success';
+
+            const summary = {
+              workflow: 'GrabNGo CI',
+              commitSha: process.env.GITHUB_SHA || 'unknown',
+              staticAndUnitResult: staticResult,
+              emulatorResult: emulatorResult,
+              passed: passed,
+              timestamp: new Date().toISOString()
+            };
+
+            fs.writeFileSync('ci-summary.json', JSON.stringify(summary, null, 2));
+            console.log('CI Summary:');
+            console.log(JSON.stringify(summary, null, 2));
+
+            if (!passed) {
+              console.error('One or more CI jobs failed.');
               process.exit(1);
             }
-            if (rc.projects.staging !== 'mad-lab-a9665') {
-              console.error('Staging alias must be mad-lab-a9665');
-              process.exit(1);
-            }
-            if (rc.projects.production) {
-              console.error('Production alias must NOT be configured in Step 3');
-              process.exit(1);
-            }
-            console.log('Firebase project aliases verified: default -> demo-grabngo-local, staging -> mad-lab-a9665.');
           "
+
+      - name: Upload CI Summary Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-summary
+          path: ci-summary.json

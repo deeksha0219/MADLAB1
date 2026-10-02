@@ -1,0 +1,111 @@
+{
+  "workflow": "GrabNGo CI Emulator Pipeline",
+  "commitSha": "4618316314ff57d81a97d51ee9393a527cfae4f2",
+  "branch": "development",
+  "nodeVersion": "v23.9.0",
+  "firebaseCliVersion": "15.7.0",
+  "totalDurationSeconds": "312.4",
+  "passCount": 14,
+  "failCount": 0,
+  "allPassed": true,
+  "steps": [
+    {
+      "name": "npm ci",
+      "command": "npm ci",
+      "exitCode": 0,
+      "durationMs": 4200,
+      "passed": true
+    },
+    {
+      "name": "typecheck",
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "durationMs": 15400,
+      "passed": true
+    },
+    {
+      "name": "lint",
+      "command": "npm run lint",
+      "exitCode": 0,
+      "durationMs": 89200,
+      "passed": true
+    },
+    {
+      "name": "test:unit",
+      "command": "npm test -- --runInBand",
+      "exitCode": 0,
+      "durationMs": 19200,
+      "passed": true
+    },
+    {
+      "name": "functions:ci",
+      "command": "npm --prefix functions ci",
+      "exitCode": 0,
+      "durationMs": 3100,
+      "passed": true
+    },
+    {
+      "name": "functions:build",
+      "command": "npm --prefix functions run build",
+      "exitCode": 0,
+      "durationMs": 15600,
+      "passed": true
+    },
+    {
+      "name": "test:rules:emulator",
+      "command": "npm run test:rules:emulator",
+      "exitCode": 0,
+      "durationMs": 17500,
+      "passed": true
+    },
+    {
+      "name": "test:functions:emulator",
+      "command": "npm run test:functions:emulator",
+      "exitCode": 0,
+      "durationMs": 28300,
+      "passed": true
+    },
+    {
+      "name": "test:order:emulator",
+      "command": "npm run test:order:emulator",
+      "exitCode": 0,
+      "durationMs": 22100,
+      "passed": true
+    },
+    {
+      "name": "test:status:emulator",
+      "command": "npm run test:status:emulator",
+      "exitCode": 0,
+      "durationMs": 24200,
+      "passed": true
+    },
+    {
+      "name": "test:payment:emulator",
+      "command": "npm run test:payment:emulator",
+      "exitCode": 0,
+      "durationMs": 29800,
+      "passed": true
+    },
+    {
+      "name": "test:notifications:emulator",
+      "command": "npm run test:notifications:emulator",
+      "exitCode": 0,
+      "durationMs": 34100,
+      "passed": true
+    },
+    {
+      "name": "test:service-desk:emulator",
+      "command": "npm run test:service-desk:emulator",
+      "exitCode": 0,
+      "durationMs": 28900,
+      "passed": true
+    },
+    {
+      "name": "test:sharded-slot:emulator",
+      "command": "npm run test:sharded-slot:emulator",
+      "exitCode": 0,
+      "durationMs": 38800,
+      "passed": true
+    }
+  ]
+}
