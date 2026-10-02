@@ -16,7 +16,7 @@
  * - 'production' : EXPLICITLY NOT CONFIGURED / REJECTED
  */
 
-export type AppEnvironment = 'local' | 'staging';
+export type AppEnvironment = 'local' | 'staging' | 'production';
 
 export interface EmulatorConfig {
   readonly host: string;
@@ -62,32 +62,60 @@ const STAGING_CONFIG: EnvironmentConfig = {
   clientCallsFunctionsEmulator: false,
 };
 
+const PRODUCTION_CONFIG: EnvironmentConfig = {
+  environment: 'production',
+  projectId: (typeof process !== 'undefined' && process.env?.GRABNGO_PROD_PROJECT_ID) ? process.env.GRABNGO_PROD_PROJECT_ID : 'grabngo-production',
+  useEmulator: false,
+  enableDebugLogs: false,
+  clientCallsFunctionsEmulator: false,
+};
+
 /**
  * Global __DEV__ flag provided by React Native bundler.
  * In development builds, default to 'local' for offline emulator safety.
- * In production/release builds, default to 'staging' (or fail if production requested).
+ * In production/release builds, require an explicit GRABNGO_ENV selector.
  */
 declare const __DEV__: boolean | undefined;
 const isDev = typeof __DEV__ !== 'undefined' ? __DEV__ : true;
 
 /**
- * Current environment selection.
- * Defaults to 'local' in development. Can be toggled programmatically via setActiveEnvironment().
+ * Resolves the build-time environment.
+ * Fails closed if a non-development build lacks explicit GRABNGO_ENV.
  */
-let currentEnvironment: AppEnvironment = isDev ? 'local' : 'staging';
+export function resolveBuildTimeEnvironment(): AppEnvironment {
+  const envVar = (typeof process !== 'undefined' && process.env?.GRABNGO_ENV)
+    ? process.env.GRABNGO_ENV.trim().toLowerCase()
+    : undefined;
 
-/**
- * Validates and resolves the active environment configuration.
- * Fails closed: rejects 'production' and any unknown environment string.
- * Never silently falls back to staging or production.
- */
-export function resolveEnvironmentConfig(envName: string): EnvironmentConfig {
-  if (envName === 'production') {
+  if (envVar) {
+    if (envVar === 'local' || envVar === 'staging' || envVar === 'production') {
+      return envVar;
+    }
     throw new Error(
-      '[SECURITY ERROR] Production environment is not configured in this project. All requests rejected.',
+      `[CONFIG ERROR] Invalid GRABNGO_ENV "${envVar}". Allowed values: 'local' | 'staging' | 'production'. Fails closed.`,
     );
   }
 
+  if (!isDev) {
+    throw new Error(
+      '[CONFIG ERROR] Non-development build requires explicit GRABNGO_ENV ("staging" | "production"). Fails closed.',
+    );
+  }
+
+  return 'local';
+}
+
+/**
+ * Current environment selection.
+ */
+let currentEnvironment: AppEnvironment = resolveBuildTimeEnvironment();
+
+/**
+ * Validates and resolves the active environment configuration.
+ * Fails closed on any unknown environment string or invalid configuration.
+ * Never silently falls back to staging or production.
+ */
+export function resolveEnvironmentConfig(envName: string): EnvironmentConfig {
   if (envName === 'local') {
     return LOCAL_CONFIG;
   }
@@ -96,8 +124,31 @@ export function resolveEnvironmentConfig(envName: string): EnvironmentConfig {
     return STAGING_CONFIG;
   }
 
+  if (envName === 'production') {
+    // Fail-closed checks for production build
+    if (!PRODUCTION_CONFIG.projectId || PRODUCTION_CONFIG.projectId.trim().length === 0) {
+      throw new Error('[SECURITY ERROR] Production project configuration is missing. Fails closed.');
+    }
+    if (PRODUCTION_CONFIG.projectId.includes('demo')) {
+      throw new Error('[SECURITY ERROR] Production cannot use demo project ID. Fails closed.');
+    }
+    if (PRODUCTION_CONFIG.projectId === STAGING_CONFIG.projectId) {
+      throw new Error('[SECURITY ERROR] Production project ID cannot match staging project ID. Fails closed.');
+    }
+    if (PRODUCTION_CONFIG.useEmulator || PRODUCTION_CONFIG.emulator) {
+      throw new Error('[SECURITY ERROR] Production build cannot connect to emulator. Fails closed.');
+    }
+    if (PRODUCTION_CONFIG.enableDebugLogs) {
+      throw new Error('[SECURITY ERROR] Debug logging must be disabled in production. Fails closed.');
+    }
+    if (typeof process !== 'undefined' && process.env?.ENABLE_LOCAL_OPERATOR_TOKEN_MINTING === 'true') {
+      throw new Error('[SECURITY ERROR] Production build cannot use local operator token minting. Fails closed.');
+    }
+    return PRODUCTION_CONFIG;
+  }
+
   throw new Error(
-    `[CONFIG ERROR] Unknown environment "${envName}". Allowed values: 'local' | 'staging'. Fails closed.`,
+    `[CONFIG ERROR] Unknown environment "${envName}". Allowed values: 'local' | 'staging' | 'production'. Fails closed.`,
   );
 }
 
@@ -109,7 +160,7 @@ export function getActiveEnvironmentConfig(): EnvironmentConfig {
 }
 
 /**
- * Sets the active environment. Rejects invalid environments, production,
+ * Sets the active environment. Rejects invalid environments,
  * and runtime switching outside local development.
  */
 export function setActiveEnvironment(env: AppEnvironment): void {

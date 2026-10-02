@@ -256,12 +256,72 @@ async function runAllTests() {
     });
 
     // Clean up any subcollections from previous runs for clean test repeatability
+  // Clean up any subcollections from previous runs for clean test repeatability
     const oldPayments = await orderRef.collection('payments').get();
     for (const d of oldPayments.docs) await d.ref.delete();
     const oldHistory = await orderRef.collection('paymentHistory').get();
     for (const d of oldHistory.docs) await d.ref.delete();
 
     return orderRef;
+  }
+
+  // --------------------------------------------------------------------------
+  // SECTION 0: Fail-Closed Synthetic Demo Mode & Project Allowlist Guard
+  // --------------------------------------------------------------------------
+  console.log('\n--- Section 0: Fail-Closed Synthetic Demo Payment Configuration ---');
+  {
+    const orderId = 'GNG-GUARD-TEST-000';
+    await createTestOrder(orderId, USERS.studentA.uid, 'CANTEEN_PAY_A');
+
+    // 1. Rejected when demo payment is explicitly disabled in config
+    await db.collection('systemConfig').doc('demoPayment').set({
+      enabled: false,
+      paymentMode: 'demo',
+      allowlist: ['demo-grabngo-local'],
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    const disabledRes = await callFunction('createDemoPayment', {
+      orderId,
+      idempotencyKey: '00000000-0000-0000-0000-000000000000',
+    }, 'studentA');
+    assert(!disabledRes.ok, 'createDemoPayment fails closed when demo payment flag is disabled');
+
+    // 2. Rejected when project ID is not in allowlist
+    await db.collection('systemConfig').doc('demoPayment').set({
+      enabled: true,
+      paymentMode: 'demo',
+      allowlist: ['some-other-project'],
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    const unallowlistedRes = await callFunction('createDemoPayment', {
+      orderId,
+      idempotencyKey: '00000000-0000-0000-0000-000000000000',
+    }, 'studentA');
+    assert(!unallowlistedRes.ok, 'createDemoPayment fails closed when project ID is not in allowlist');
+
+    // 3. Client tampering: client passes extra fields to bypass guard
+    await db.collection('systemConfig').doc('demoPayment').set({
+      enabled: true,
+      paymentMode: 'demo',
+      allowlist: ['demo-grabngo-local'],
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    const clientTamperRes = await callFunction('createDemoPayment', {
+      orderId,
+      idempotencyKey: '00000000-0000-0000-0000-000000000000',
+      isDemoPayment: true,
+      overrideGuard: true,
+    }, 'studentA');
+    assert(!clientTamperRes.ok, 'Client payload cannot override demo payment guard');
+
+    // 4. Cash order cannot create online demo payment attempt
+    const cashOrderId = 'GNG-CASH-TEST-000';
+    await createTestOrder(cashOrderId, USERS.studentA.uid, 'CANTEEN_PAY_A', 'cash');
+    const cashRes = await callFunction('createDemoPayment', {
+      orderId: cashOrderId,
+      idempotencyKey: '00000000-0000-0000-0000-000000000000',
+    }, 'studentA');
+    assert(!cashRes.ok, 'Cash orders cannot create online demo payment attempts');
   }
 
   // --------------------------------------------------------------------------

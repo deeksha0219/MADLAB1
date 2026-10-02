@@ -17,6 +17,7 @@
     "test:payment:emulator": "npx firebase-tools emulators:exec --only auth,firestore,functions --project demo-grabngo-local \"node scripts/run-emulator-payment-test.js\"",
     "test:notifications:emulator": "npx firebase-tools emulators:exec --only auth,firestore,functions --project demo-grabngo-local \"node scripts/run-emulator-notifications-test.js\"",
     "test:service-desk:emulator": "npx firebase-tools emulators:exec --only auth,firestore,functions --project demo-grabngo-local \"node scripts/run-emulator-service-desk-test.js\"",
+    "test:sharded-slot:emulator": "npx firebase-tools emulators:exec --only auth,firestore,functions --project demo-grabngo-local \"node scripts/run-emulator-sharded-slot-test.js\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

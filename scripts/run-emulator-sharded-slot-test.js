@@ -204,6 +204,13 @@ async function seedBaseFixtures() {
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
+  await db.collection('systemConfig').doc('demoPayment').set({
+    enabled: true,
+    paymentMode: 'demo',
+    allowlist: ['demo-grabngo-local'],
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
   console.log('  Base fixtures seeded successfully.');
 }
 

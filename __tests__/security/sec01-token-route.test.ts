@@ -233,5 +233,42 @@ describe('SEC-01: Operator Token Route Security & Boundary Invariants', () => {
         expect(res.body).not.toContain('idToken');
       }
     });
+
+    test('Path traversal attempts return 403 Forbidden', async () => {
+      testServer = createServiceDeskServer({ bindHost: '127.0.0.1', env: baseValidEnv });
+      await new Promise<void>((resolve) => testServer.listen(0, '127.0.0.1', resolve));
+
+      const traversalPaths = [
+        '/../package.json',
+        '/../../functions/package.json',
+        '/..%2F..%2Fpackage.json',
+      ];
+      for (const tPath of traversalPaths) {
+        const res = await request(testServer, { path: tPath, method: 'GET' });
+        expect(res.statusCode).toBe(403);
+        expect(res.body).toContain('Path traversal detected');
+      }
+    });
+
+    test('CORS restricts origins strictly to localhost/127.0.0.1 and rejects external origins', async () => {
+      testServer = createServiceDeskServer({ bindHost: '127.0.0.1', env: baseValidEnv });
+      await new Promise<void>((resolve) => testServer.listen(0, '127.0.0.1', resolve));
+
+      // Localhost origin allowed
+      const localRes = await request(testServer, {
+        path: '/',
+        method: 'GET',
+        headers: { Origin: 'http://localhost:3000' },
+      });
+      expect(localRes.headers['access-control-allow-origin']).toBe('http://localhost:3000');
+
+      // External origin disallowed
+      const evilRes = await request(testServer, {
+        path: '/',
+        method: 'GET',
+        headers: { Origin: 'https://evil-site.com' },
+      });
+      expect(evilRes.headers['access-control-allow-origin']).toBeUndefined();
+    });
   });
 });

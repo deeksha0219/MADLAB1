@@ -29,6 +29,8 @@ export interface NotificationOutboxEntry {
   readonly attemptCount: number;
   readonly maxAttempts: number;
   readonly lastErrorCode?: string;
+  readonly leaseUntil?: admin.firestore.Timestamp | null;
+  readonly nextRetryAt?: admin.firestore.Timestamp | null;
   readonly createdAt: admin.firestore.FieldValue;
   readonly updatedAt: admin.firestore.FieldValue;
   readonly processedAt?: admin.firestore.FieldValue;
@@ -76,6 +78,20 @@ export function getFirestoreFieldValue(): any {
   return (admin as any).firestore.FieldValue;
 }
 
+export function getFirestoreTimestamp(): any {
+  if ((admin as any).firestore?.Timestamp?.fromMillis) {
+    return (admin as any).firestore.Timestamp;
+  }
+  if ((admin as any).default?.firestore?.Timestamp?.fromMillis) {
+    return (admin as any).default.firestore.Timestamp;
+  }
+  try {
+    const { Timestamp } = require('@google-cloud/firestore');
+    if (Timestamp?.fromMillis) return Timestamp;
+  } catch (_) {}
+  return (admin as any).firestore?.Timestamp;
+}
+
 /**
  * Writes a notification outbox record transactionally inside an existing Firestore transaction.
  * Guarantees atomicity: if the parent business transaction aborts, zero outbox records commit.
@@ -107,6 +123,8 @@ export function writeNotificationOutboxTx(
     status: 'pending' as OutboxStatus,
     attemptCount: 0,
     maxAttempts: 5,
+    leaseUntil: null,
+    nextRetryAt: null,
     createdAt: now,
     updatedAt: now,
   };

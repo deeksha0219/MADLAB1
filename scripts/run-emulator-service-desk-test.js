@@ -151,6 +151,13 @@ async function setupFixtures() {
     isOpen: true,
   });
 
+  await db.collection('systemConfig').doc('demoPayment').set({
+    enabled: true,
+    paymentMode: 'demo',
+    allowlist: ['demo-grabngo-local'],
+    updatedAt: now,
+  });
+
   console.log('[Setup] Seed completed.');
 }
 

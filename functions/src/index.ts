@@ -20,7 +20,12 @@ import {
   notifyAssignedCanteenAdmins,
 } from './notifications/notificationService';
 import { writeNotificationOutboxTx } from './notifications/notificationOutbox';
-export { processNotificationOutbox } from './notifications/notificationWorker';
+export {
+  processNotificationOutbox,
+  scheduledOutboxSweeper,
+  sweepNotificationOutbox,
+  replayDeadLetterOutbox,
+} from './notifications/notificationWorker';
 import {
   computeShardCapacities,
   planSlotReservationTx,
@@ -55,6 +60,17 @@ function timestampFromMillis(millis: number) {
   } catch {
     return (admin.firestore as any).Timestamp.fromMillis(millis);
   }
+}
+
+function fieldValueIncrement(n: number) {
+  try {
+    const { FieldValue } = require('@google-cloud/firestore');
+    if (FieldValue?.increment) return FieldValue.increment(n);
+  } catch (_) {}
+  if ((admin as any).firestore?.FieldValue?.increment) {
+    return (admin as any).firestore.FieldValue.increment(n);
+  }
+  return (admin as any).firestore.FieldValue.increment(n);
 }
 
 // Approved canteen identifiers in GrabNGo
@@ -2368,23 +2384,16 @@ export const transitionOrderStatus = functions.https.onCall(
 );
 
 /**
- * Callable Function: verifyDemoPayment (Step 8 — Emulator-Only Demo Behavior)
+ * Callable Function: verifyDemoPayment (Step 8 & Remediation Harmonization)
  *
- * Simulates verified online payment for UPI demo checkout strictly within the local emulator.
- * RESTRICTED: Will fail with failed-precondition if FUNCTIONS_EMULATOR !== 'true'.
+ * Synthetic demo payment verification harmonized with the canonical payment state machine.
+ * Guaranteed: Writes canonical payment attempt in orders/{orderId}/payments subcollection,
+ * updates order payment pointers, and enforces fail-closed server environment configuration.
  * Does not use, accept, or process real payment credentials.
  */
 export const verifyDemoPayment = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard
-    if (process.env.FUNCTIONS_EMULATOR !== 'true') {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'verifyDemoPayment is an emulator-only testing helper and is disabled in cloud environments.',
-      );
-    }
-
-    // 2. Authentication
+    // 1. Authentication
     if (!context.auth || !context.auth.uid) {
       throw new functions.https.HttpsError(
         'unauthenticated',
@@ -2398,6 +2407,9 @@ export const verifyDemoPayment = functions.https.onCall(
     const orderRef = db.collection('orders').doc(orderId);
 
     return await db.runTransaction(async (transaction) => {
+      // 2. Server-side Demo Payment Environment Guard
+      await assertDemoPaymentAllowed('verifyDemoPayment', transaction);
+
       const orderSnap = await transaction.get(orderRef);
       if (!orderSnap.exists) {
         throw new functions.https.HttpsError('not-found', `Order ${orderId} not found.`);
@@ -2427,14 +2439,45 @@ export const verifyDemoPayment = functions.https.onCall(
         );
       }
 
-      // Write 1: Update paymentStatus and order status (Canonical succeeded_demo per Step 9)
+      const amountInPaise = orderData.pricing?.totalInPaise ?? orderData.totalInPaise;
+      const paymentId = `pay_demo_${orderId}`;
+      const paymentRef = orderRef.collection('payments').doc(paymentId);
+      const attemptNumber = (orderData.totalPaymentAttempts || 0) + 1;
+
+      // Write 1: Canonical demo payment record in subcollection
+      transaction.set(paymentRef, {
+        paymentId,
+        orderId,
+        studentUid: orderData.studentUid,
+        canteenId: orderData.canteenId,
+        amountInPaise,
+        currency: 'INR',
+        paymentMethod: orderData.paymentMethod,
+        provider: 'demo_synthetic',
+        status: 'succeeded_demo',
+        refundStatus: 'not_requested',
+        attemptNumber,
+        providerReference: `demo_synth_${orderId}_${Date.now()}`,
+        isDemoPayment: true,
+        disclaimer: 'Demo payment — no real money transferred',
+        failureCode: null,
+        failureMessage: null,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        completedAt: serverTimestamp(),
+      });
+
+      // Write 2: Update order tracking and status atomically
       transaction.update(orderRef, {
+        activePaymentId: paymentId,
+        hasSuccessfulPayment: true,
+        totalPaymentAttempts: attemptNumber,
         paymentStatus: 'succeeded_demo',
         status: 'payment_verified',
         updatedAt: serverTimestamp(),
       });
 
-      // Write 2: Add deterministic history entry
+      // Write 3: Add deterministic history entry
       const eventId = `${orderId}_placed_to_payment_verified`;
       const historyRef = orderRef.collection('statusHistory').doc(eventId);
       transaction.set(historyRef, {
@@ -2445,15 +2488,18 @@ export const verifyDemoPayment = functions.https.onCall(
         actorUid: callerUid,
         actorRole: 'demo_payment_gateway',
         canteenId: orderData.canteenId,
-        reason: 'Demo UPI payment verified locally in emulator',
+        reason: 'Demo payment — no real money transferred',
         createdAt: serverTimestamp(),
       });
 
       return {
         success: true,
         orderId,
+        paymentId,
         status: 'payment_verified',
         paymentStatus: 'succeeded_demo',
+        isDemoPayment: true,
+        message: 'Demo payment — no real money transferred',
       };
     });
   },
@@ -2803,11 +2849,12 @@ export const listOperationalOrders = functions.https.onCall(
 
     const snapshot = await query.get();
 
-    // Compute live incoming eligible order count for targetCanteen (Section 1.4)
+    // Compute live incoming eligible order count for targetCanteen (Section 1.4, bounded to at most 100)
     const incomingSnap = await db
       .collection('orders')
       .where('canteenId', '==', targetCanteen)
       .where('status', 'in', ['placed', 'payment_verified'])
+      .limit(100)
       .get();
     const incomingEligibleCount = incomingSnap.docs.filter((doc) =>
       isOrderIncomingEligible(doc.data()),
@@ -3298,13 +3345,89 @@ export const PAYMENT_ATTEMPT_TTL_MS = 15 * 60 * 1000; // 15 minutes
 export const MAX_PAYMENT_AMOUNT_PAISE = 500000; // 500,000 paise (₹5,000)
 
 /**
- * Enforces strict emulator-only execution for demo payment operations.
+ * Fail-closed server-side verification for synthetic demo payment execution.
+ *
+ * Invariants:
+ * 1. Fails closed: DEMO_PAYMENT_ENABLED must be explicitly true.
+ * 2. PAYMENT_MODE must be explicitly 'demo'.
+ * 3. Project ID must be explicitly listed in DEMO_PAYMENT_PROJECT_ALLOWLIST.
+ * 4. Fails closed if any real payment gateway credentials exist in environment.
+ * 5. Supports server-owned Firestore /systemConfig/demoPayment overrides (Admin-only).
+ * 6. Client cannot supply or alter any configuration flag.
  */
-function assertEmulatorOnly(opName: string): void {
-  if (process.env.FUNCTIONS_EMULATOR !== 'true') {
+export async function assertDemoPaymentAllowed(
+  opName: string,
+  transaction?: FirebaseFirestore.Transaction,
+): Promise<void> {
+  // Guard 1: Detect and reject real gateway credentials
+  if (
+    process.env.RAZORPAY_KEY_ID ||
+    process.env.RAZORPAY_KEY_SECRET ||
+    process.env.STRIPE_SECRET_KEY ||
+    process.env.PAYMENT_GATEWAY_KEY
+  ) {
     throw new functions.https.HttpsError(
       'failed-precondition',
-      `${opName} is only allowed in local emulator environment.`,
+      'Real payment gateway credentials detected. Synthetic demo payment is strictly disabled.',
+    );
+  }
+
+  // Guard 2: Server-side environment configuration (fail-closed defaults)
+  let paymentMode = process.env.PAYMENT_MODE || 'none';
+  let demoPaymentEnabled = process.env.DEMO_PAYMENT_ENABLED === 'true';
+  const rawAllowlist = process.env.DEMO_PAYMENT_PROJECT_ALLOWLIST || '';
+  let allowlist = rawAllowlist
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (allowlist.length === 0 && process.env.FUNCTIONS_EMULATOR === 'true') {
+    allowlist = ['demo-grabngo-local'];
+  }
+
+  // Guard 3: Server-side Firestore configuration override (/systemConfig/demoPayment)
+  // Protected by firestore.rules (zero client read/write allowed)
+  try {
+    const configRef = db.collection('systemConfig').doc('demoPayment');
+    const configSnap = transaction ? await transaction.get(configRef) : await configRef.get();
+    if (configSnap.exists) {
+      const cfg = configSnap.data() || {};
+      if (typeof cfg.enabled === 'boolean') {
+        demoPaymentEnabled = cfg.enabled;
+      }
+      if (typeof cfg.paymentMode === 'string') {
+        paymentMode = cfg.paymentMode;
+      }
+      if (Array.isArray(cfg.allowlist)) {
+        allowlist = cfg.allowlist;
+      }
+    }
+  } catch (err: any) {
+    if (process.env.FUNCTIONS_EMULATOR !== 'true') {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        `Unable to verify server payment configuration: ${err?.message}`,
+      );
+    }
+  }
+
+  if (paymentMode !== 'demo' || !demoPaymentEnabled) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `${opName} is disabled: PAYMENT_MODE must be 'demo' and DEMO_PAYMENT_ENABLED must be true. Demo payment — no real money transferred.`,
+    );
+  }
+
+  // Guard 4: Project allowlist verification
+  const currentProject =
+    process.env.GCLOUD_PROJECT ||
+    (process.env.FIREBASE_CONFIG ? JSON.parse(process.env.FIREBASE_CONFIG).projectId : '') ||
+    '';
+
+  if (!currentProject || !allowlist.includes(currentProject)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `${opName} is disabled: Project '${currentProject}' is not allowlisted in DEMO_PAYMENT_PROJECT_ALLOWLIST.`,
     );
   }
 }
@@ -3553,13 +3676,12 @@ export const createDemoPayment = functions.https.onCall(
         );
       }
 
-      // READ 3: Existing Payment Attempts for this order
-      const paymentsSnap = await transaction.get(orderRef.collection('payments'));
-      const existingPayments = paymentsSnap.docs.map((d) => d.data());
+      // Server-side Demo Payment Environment Guard
+      await assertDemoPaymentAllowed('createDemoPayment', transaction);
 
+      // READ 3: Server-Owned Pointers & Counters (O(1) read, eliminating unbounded collection scan)
       // Rule: Order must not already have a succeeded_demo payment
-      const hasSucceeded = existingPayments.some((p) => p.status === 'succeeded_demo');
-      if (hasSucceeded || orderData.paymentStatus === 'succeeded_demo') {
+      if (orderData.hasSuccessfulPayment === true || orderData.paymentStatus === 'succeeded_demo') {
         throw new functions.https.HttpsError(
           'failed-precondition',
           `Order ${orderId} has already been successfully paid.`,
@@ -3567,7 +3689,29 @@ export const createDemoPayment = functions.https.onCall(
       }
 
       // Rule: Max 3 failed attempts per order
-      const failedCount = existingPayments.filter((p) => p.status === 'failed').length;
+      let failedCount = typeof orderData.failedPaymentCount === 'number' ? orderData.failedPaymentCount : 0;
+      let totalAttempts = typeof orderData.totalPaymentAttempts === 'number' ? orderData.totalPaymentAttempts : 0;
+
+      // Migration-safe bounded fallback for legacy orders without initialized counters
+      if (orderData.failedPaymentCount === undefined && orderData.totalPaymentAttempts === undefined) {
+        const legacyPaymentsSnap = await transaction.get(orderRef.collection('payments').limit(10));
+        if (legacyPaymentsSnap.size >= 10) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Maximum payment attempts (10) exceeded for order ${orderId}.`,
+          );
+        }
+        const legacyDocs = legacyPaymentsSnap.docs.map((d) => d.data());
+        if (legacyDocs.some((p) => p.status === 'succeeded_demo')) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Order ${orderId} has already been successfully paid.`,
+          );
+        }
+        failedCount = legacyDocs.filter((p) => p.status === 'failed').length;
+        totalAttempts = legacyDocs.length;
+      }
+
       if (failedCount >= 3) {
         throw new functions.https.HttpsError(
           'failed-precondition',
@@ -3577,55 +3721,58 @@ export const createDemoPayment = functions.https.onCall(
 
       // Rule: Max 1 active attempt (processing) with Transaction-Safe Expiry (Correction 3 & 4)
       const nowMs = Date.now();
-      for (const p of existingPayments) {
-        if (p.status === 'processing') {
-          const pExpiresMs = p.expiresAt?.toMillis?.() || 0;
-          const orderExpiresMs = orderData.activePaymentExpiresAt?.toMillis?.() || 0;
-          const isPaymentExpired = pExpiresMs <= nowMs;
-          const isOrderExpired = orderExpiresMs <= nowMs;
-          const isActiveOnOrder = orderData.activePaymentId === p.paymentId;
+      if (orderData.activePaymentId) {
+        const activePaymentRef = orderRef.collection('payments').doc(orderData.activePaymentId);
+        const activePaymentSnap = await transaction.get(activePaymentRef);
+        if (activePaymentSnap.exists) {
+          const p = activePaymentSnap.data()!;
+          if (p.status === 'processing') {
+            const pExpiresMs = p.expiresAt?.toMillis?.() || 0;
+            const orderExpiresMs = orderData.activePaymentExpiresAt?.toMillis?.() || 0;
+            const isPaymentExpired = pExpiresMs <= nowMs;
+            const isOrderExpired = orderExpiresMs <= nowMs;
 
-          if (isActiveOnOrder && isPaymentExpired && isOrderExpired) {
-            // Lazy-expire active attempt transactionally
-            const expiredPaymentRef = orderRef.collection('payments').doc(p.paymentId);
-            transaction.update(expiredPaymentRef, {
-              status: 'expired',
-              expiredAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
+            if (isPaymentExpired && isOrderExpired) {
+              // Lazy-expire active attempt transactionally
+              transaction.update(activePaymentRef, {
+                status: 'expired',
+                expiredAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              });
 
-            transaction.update(orderRef, {
-              activePaymentId: null,
-              activePaymentExpiresAt: null,
-              paymentStatus: 'pending',
-              updatedAt: serverTimestamp(),
-            });
+              transaction.update(orderRef, {
+                activePaymentId: null,
+                activePaymentExpiresAt: null,
+                paymentStatus: 'pending',
+                updatedAt: serverTimestamp(),
+              });
 
-            const expireEventId = `${p.paymentId}_expired`;
-            const expireHistRef = orderRef.collection('paymentHistory').doc(expireEventId);
-            transaction.set(expireHistRef, {
-              eventId: expireEventId,
-              paymentId: p.paymentId,
-              orderId,
-              fromStatus: p.status,
-              toStatus: 'expired',
-              actorUid: studentUid,
-              actorRole: 'system',
-              canteenId: orderData.canteenId,
-              reason: 'Active payment attempt expired by TTL timeout',
-              createdAt: serverTimestamp(),
-            });
-          } else {
-            throw new functions.https.HttpsError(
-              'failed-precondition',
-              `An active payment attempt is already in progress for order ${orderId}.`,
-            );
+              const expireEventId = `${p.paymentId}_expired`;
+              const expireHistRef = orderRef.collection('paymentHistory').doc(expireEventId);
+              transaction.set(expireHistRef, {
+                eventId: expireEventId,
+                paymentId: p.paymentId,
+                orderId,
+                fromStatus: p.status,
+                toStatus: 'expired',
+                actorUid: studentUid,
+                actorRole: 'system',
+                canteenId: orderData.canteenId,
+                reason: 'Active payment attempt expired by TTL timeout',
+                createdAt: serverTimestamp(),
+              });
+            } else {
+              throw new functions.https.HttpsError(
+                'failed-precondition',
+                `An active payment attempt is already in progress for order ${orderId}.`,
+              );
+            }
           }
         }
       }
 
       // Validations passed: generate new payment attempt with Cryptographic Identifiers (Part 4)
-      const attemptNumber = existingPayments.length + 1;
+      const attemptNumber = totalAttempts + 1;
       const paymentId = `pay_${crypto.randomUUID()}`;
       const providerReference = `demo_txn_${crypto.randomUUID()}`;
       const expiresAt = timestampFromMillis(nowMs + PAYMENT_ATTEMPT_TTL_MS);
@@ -3640,13 +3787,15 @@ export const createDemoPayment = functions.https.onCall(
         amountInPaise,
         currency: 'INR',
         paymentMethod,
-        provider: 'demo',
+        provider: 'demo_synthetic',
         status: 'processing',
         refundStatus: 'not_requested',
         attemptNumber,
         idempotencyKey,
         requestFingerprint,
         providerReference,
+        isDemoPayment: true,
+        disclaimer: 'Demo payment — no real money transferred',
         failureCode: null,
         failureMessage: null,
         createdAt: serverTimestamp(),
@@ -3657,10 +3806,13 @@ export const createDemoPayment = functions.https.onCall(
         refundedAt: null,
       });
 
-      // Write 2: Update Order Active Payment Tracking
+      // Write 2: Update Order Active Payment Tracking & Server-Owned Counters
       transaction.update(orderRef, {
         activePaymentId: paymentId,
         activePaymentExpiresAt: expiresAt,
+        totalPaymentAttempts: attemptNumber,
+        failedPaymentCount: failedCount,
+        hasSuccessfulPayment: false,
         paymentStatus: 'processing',
         updatedAt: serverTimestamp(),
       });
@@ -3703,6 +3855,8 @@ export const createDemoPayment = functions.https.onCall(
         amountInPaise,
         currency: 'INR',
         providerReference,
+        isDemoPayment: true,
+        message: 'Demo payment — no real money transferred',
         expiresAt,
       };
     });
@@ -3718,10 +3872,7 @@ export const createDemoPayment = functions.https.onCall(
  */
 export const completeDemoPayment = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard
-    assertEmulatorOnly('completeDemoPayment');
-
-    // 2. Authentication
+    // 1. Authentication
     if (!context.auth || !context.auth.uid) {
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
     }
@@ -3735,6 +3886,9 @@ export const completeDemoPayment = functions.https.onCall(
     const paymentRef = orderRef.collection('payments').doc(paymentId);
 
     return await db.runTransaction(async (transaction) => {
+      // 2. Server-side Demo Payment Environment Guard
+      await assertDemoPaymentAllowed('completeDemoPayment', transaction);
+
       // READ 1: Order
       const orderSnap = await transaction.get(orderRef);
       if (!orderSnap.exists) {
@@ -3776,10 +3930,10 @@ export const completeDemoPayment = functions.https.onCall(
           `Payment currency '${paymentData.currency}' is invalid. Must be 'INR'.`,
         );
       }
-      if (paymentData.provider !== 'demo') {
+      if (paymentData.provider !== 'demo' && paymentData.provider !== 'demo_synthetic') {
         throw new functions.https.HttpsError(
           'failed-precondition',
-          `Payment provider '${paymentData.provider}' is invalid. Must be 'demo'.`,
+          `Payment provider '${paymentData.provider}' is invalid. Must be 'demo' or 'demo_synthetic'.`,
         );
       }
 
@@ -3848,6 +4002,7 @@ export const completeDemoPayment = functions.https.onCall(
       transaction.update(orderRef, {
         status: 'payment_verified',
         paymentStatus: 'succeeded_demo',
+        hasSuccessfulPayment: true,
         activePaymentId: null,
         activePaymentExpiresAt: null,
         updatedAt: serverTimestamp(),
@@ -3865,7 +4020,7 @@ export const completeDemoPayment = functions.https.onCall(
         actorUid: callerUid,
         actorRole: isAdmin ? 'admin' : 'student',
         canteenId: orderData.canteenId,
-        reason: 'Demo payment completed successfully in emulator',
+        reason: 'Demo payment completed — no real money transferred',
         createdAt: serverTimestamp(),
       });
 
@@ -3880,7 +4035,7 @@ export const completeDemoPayment = functions.https.onCall(
         actorUid: callerUid,
         actorRole: isAdmin ? 'admin' : 'student',
         canteenId: orderData.canteenId,
-        reason: 'Demo payment verified in emulator',
+        reason: 'Demo payment verified — no real money transferred',
         createdAt: serverTimestamp(),
       });
 
@@ -3915,6 +4070,7 @@ export const completeDemoPayment = functions.https.onCall(
         paymentId,
         status: 'succeeded_demo',
         orderStatus: 'payment_verified',
+        message: 'Demo payment — no real money transferred',
       };
     });
   },
@@ -3927,8 +4083,8 @@ export const completeDemoPayment = functions.https.onCall(
  */
 export const failDemoPayment = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard
-    assertEmulatorOnly('failDemoPayment');
+    // 1. Synthetic Demo Guard (fail-closed, project-allowlisted)
+    await assertDemoPaymentAllowed('failDemoPayment');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -4016,6 +4172,7 @@ export const failDemoPayment = functions.https.onCall(
       // Write 2: Update order paymentStatus & clear active payment (Order status remains 'placed'!)
       transaction.update(orderRef, {
         paymentStatus: 'failed',
+        failedPaymentCount: fieldValueIncrement(1),
         activePaymentId: null,
         activePaymentExpiresAt: null,
         updatedAt: serverTimestamp(),
@@ -4077,8 +4234,8 @@ export const failDemoPayment = functions.https.onCall(
  */
 export const cancelDemoPayment = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard
-    assertEmulatorOnly('cancelDemoPayment');
+    // 1. Synthetic Demo Guard (fail-closed, project-allowlisted)
+    await assertDemoPaymentAllowed('cancelDemoPayment');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -4187,7 +4344,7 @@ export const cancelDemoPayment = functions.https.onCall(
  */
 export const expirePaymentAttempt = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    assertEmulatorOnly('expirePaymentAttempt');
+    await assertDemoPaymentAllowed('expirePaymentAttempt');
 
     if (!context.auth || !context.auth.uid) {
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
@@ -4280,6 +4437,7 @@ export const expirePaymentAttempt = functions.https.onCall(
         activePaymentId: null,
         activePaymentExpiresAt: null,
         paymentStatus: 'pending',
+        failedPaymentCount: fieldValueIncrement(1),
         updatedAt: serverTimestamp(),
       });
 
@@ -4407,8 +4565,8 @@ export const getPaymentStatus = functions.https.onCall(
  */
 export const requestDemoRefund = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard
-    assertEmulatorOnly('requestDemoRefund');
+    // 1. Synthetic Demo Guard (fail-closed, project-allowlisted)
+    await assertDemoPaymentAllowed('requestDemoRefund');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -4565,7 +4723,7 @@ export const requestDemoRefund = functions.https.onCall(
 );
 
 /**
- * Callable Function: completeDemoRefund (Step 9 Hardening — Emulator Only)
+ * Callable Function: completeDemoRefund (Step 9 Hardening — Synthetic Demo)
  *
  * Finalizes demo refund state to 'succeeded_demo'. Admin authorization required.
  * Derives full refund amount server-side; rejects client-supplied refund amounts (Correction 7).
@@ -4573,8 +4731,8 @@ export const requestDemoRefund = functions.https.onCall(
  */
 export const completeDemoRefund = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    // 1. Emulator Guard
-    assertEmulatorOnly('completeDemoRefund');
+    // 1. Synthetic Demo Guard (fail-closed, project-allowlisted)
+    await assertDemoPaymentAllowed('completeDemoRefund');
 
     // 2. Authentication
     if (!context.auth || !context.auth.uid) {
@@ -4666,7 +4824,7 @@ export const completeDemoRefund = functions.https.onCall(
         actorUid: callerUid,
         actorRole: 'admin',
         canteenId: orderData.canteenId,
-        reason: 'Demo refund finalized by canteen administrator in emulator',
+        reason: 'Demo refund finalized — no real money transferred',
         createdAt: serverTimestamp(),
       });
 
@@ -5268,39 +5426,55 @@ export const markNotificationRead = functions.https.onCall(
     }
     const notificationId = data.notificationId;
 
-    // 4. Fetch notification (path is already scoped to this user)
     const notifRef = db
       .collection('users')
       .doc(recipientUid)
       .collection('notifications')
       .doc(notificationId);
+    const userRef = db.collection('users').doc(recipientUid);
 
-    const notifSnap = await notifRef.get();
-    if (!notifSnap.exists) {
-      throw new functions.https.HttpsError('not-found', 'Notification not found.');
-    }
-    const notifData = notifSnap.data()!;
+    return await db.runTransaction(async (transaction) => {
+      const notifSnap = await transaction.get(notifRef);
+      if (!notifSnap.exists) {
+        throw new functions.https.HttpsError('not-found', 'Notification not found.');
+      }
+      const notifData = notifSnap.data()!;
 
-    // 5. Ownership verification (defense-in-depth — path already scoped by uid)
-    if (notifData.recipientUid !== recipientUid) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'Not authorized to modify this notification.',
-      );
-    }
+      // Ownership verification (defense-in-depth — path already scoped by uid)
+      if (notifData.recipientUid !== recipientUid) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'Not authorized to modify this notification.',
+        );
+      }
 
-    // 6. Idempotent: already read
-    if (notifData.isRead === true) {
-      return { success: true, isIdempotent: true, notificationId };
-    }
+      // Idempotent: already read — does not decrement counter again
+      if (notifData.isRead === true) {
+        return { success: true, isIdempotent: true, notificationId };
+      }
 
-    // 7. Update ONLY isRead and readAt — never modify type, title, body, orderId, or createdAt
-    await notifRef.update({
-      isRead: true,
-      readAt: serverTimestamp(),
+      // Read phase: all reads must precede writes in Firestore transaction
+      const userSnap = await transaction.get(userRef);
+
+      // Write phase:
+      // Update notification
+      transaction.update(notifRef, {
+        isRead: true,
+        readAt: serverTimestamp(),
+      });
+
+      // Atomically decrement server-maintained unread counter without underflow
+      if (userSnap.exists) {
+        const cur = userSnap.data()?.unreadNotificationCount;
+        const nextCount = typeof cur === 'number' && cur > 0 ? cur - 1 : 0;
+        transaction.update(userRef, {
+          unreadNotificationCount: nextCount,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      return { success: true, isIdempotent: false, notificationId };
     });
-
-    return { success: true, isIdempotent: false, notificationId };
   },
 );
 
@@ -5311,6 +5485,7 @@ export const markNotificationRead = functions.https.onCall(
  * - Accepts only: {} or { cursor }
  * - Uses bounded batches of at most 500 notifications per call
  * - Updates ONLY isRead and readAt
+ * - Decrements server-maintained unread counter atomically
  * - Idempotent: safe to call multiple times
  */
 export const markAllNotificationsRead = functions.https.onCall(
@@ -5366,6 +5541,11 @@ export const markAllNotificationsRead = functions.https.onCall(
     const unreadSnap = await query.get();
 
     if (unreadSnap.empty) {
+      // Counter repair in case of drift
+      await db.collection('users').doc(recipientUid).set({
+        unreadNotificationCount: 0,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
       return { success: true, updatedCount: 0, hasMore: false, nextCursor: null };
     }
 
@@ -5377,10 +5557,23 @@ export const markAllNotificationsRead = functions.https.onCall(
       batch.update(doc.ref, { isRead: true, readAt: now });
     });
 
-    await batch.commit();
-
     const hasMore = unreadSnap.docs.length === 500;
     const nextCursor = hasMore ? unreadSnap.docs[unreadSnap.docs.length - 1].id : null;
+    const userRef = db.collection('users').doc(recipientUid);
+
+    if (!hasMore) {
+      batch.set(userRef, {
+        unreadNotificationCount: 0,
+        updatedAt: now,
+      }, { merge: true });
+    } else {
+      batch.set(userRef, {
+        unreadNotificationCount: fieldValueIncrement(-unreadSnap.docs.length),
+        updatedAt: now,
+      }, { merge: true });
+    }
+
+    await batch.commit();
 
     return {
       success: true,
@@ -5395,7 +5588,8 @@ export const markAllNotificationsRead = functions.https.onCall(
  * Callable: getUnreadNotificationCount
  *
  * Returns the count of unread notifications for the authenticated caller.
- * - Accepts only: {} (empty payload)
+ * Uses O(1) server-maintained counter to avoid full collection reads.
+ * Falls back to bounded count and auto-repairs if counter is missing or corrupted.
  */
 export const getUnreadNotificationCount = functions.https.onCall(
   async (data: Record<string, any>, context) => {
@@ -5411,14 +5605,65 @@ export const getUnreadNotificationCount = functions.https.onCall(
     // 2. Strict input allowlist — empty payload only
     rejectUnknownFields(data, [], 'getUnreadNotificationCount');
 
-    // 3. Count unread
+    // 3. Fast O(1) read from server-maintained counter
+    const userRef = db.collection('users').doc(recipientUid);
+    const userSnap = await userRef.get();
+    const count = userSnap.data()?.unreadNotificationCount;
+
+    if (typeof count === 'number' && count >= 0) {
+      return { success: true, unreadCount: count };
+    }
+
+    // 4. Auto-repair drift/missing counter via bounded read (up to 100)
     const snap = await db
       .collection('users')
       .doc(recipientUid)
       .collection('notifications')
       .where('isRead', '==', false)
+      .limit(100)
       .get();
 
-    return { success: true, unreadCount: snap.size };
+    const repairedCount = snap.size;
+    await userRef.set({
+      unreadNotificationCount: repairedCount,
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+
+    return { success: true, unreadCount: repairedCount, isRepaired: true };
+  },
+);
+
+/**
+ * Callable: repairUnreadNotificationCount
+ *
+ * Privileged/Self repair of unreadNotificationCount.
+ * Platform operators can repair for any user; users can repair their own count.
+ */
+export const repairUnreadNotificationCount = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+    rejectUnknownFields(data, ['targetUid'], 'repairUnreadNotificationCount');
+    const targetUid = data.targetUid ? validateId(data.targetUid, 'targetUid') : context.auth.uid;
+    if (targetUid !== context.auth.uid) {
+      await verifyPlatformOperator(context);
+    }
+
+    const snap = await db
+      .collection('users')
+      .doc(targetUid)
+      .collection('notifications')
+      .where('isRead', '==', false)
+      .limit(500)
+      .get();
+
+    const actualCount = snap.size;
+    await db.collection('users').doc(targetUid).set({
+      unreadNotificationCount: actualCount,
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+
+    return { success: true, targetUid, repairedCount: actualCount };
   },
 );

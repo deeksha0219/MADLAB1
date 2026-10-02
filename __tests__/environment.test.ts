@@ -30,10 +30,26 @@ describe('GrabNGo - Environment Configuration Security Foundation', () => {
     expect(config.clientCallsFunctionsEmulator).toBe(false);
   });
 
-  test('rejects production environment with a security error (never falls back)', () => {
-    expect(() => {
-      resolveEnvironmentConfig('production');
-    }).toThrow(/Production environment is not configured/);
+  test('production environment targets production project and strictly disables emulators', () => {
+    const config = resolveEnvironmentConfig('production');
+    expect(config.environment).toBe('production');
+    expect(config.projectId).toBe('grabngo-production');
+    expect(config.useEmulator).toBe(false);
+    expect(config.emulator).toBeUndefined();
+    expect(config.clientCallsFunctionsEmulator).toBe(false);
+    expect(config.enableDebugLogs).toBe(false);
+  });
+
+  test('production environment rejects local operator token minting', () => {
+    const origEnv = process.env.ENABLE_LOCAL_OPERATOR_TOKEN_MINTING;
+    try {
+      process.env.ENABLE_LOCAL_OPERATOR_TOKEN_MINTING = 'true';
+      expect(() => {
+        resolveEnvironmentConfig('production');
+      }).toThrow(/Production build cannot use local operator token minting/);
+    } finally {
+      process.env.ENABLE_LOCAL_OPERATOR_TOKEN_MINTING = origEnv;
+    }
   });
 
   test('rejects unknown environment strings (fails closed)', () => {

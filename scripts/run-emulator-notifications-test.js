@@ -233,6 +233,14 @@ async function seedTestData() {
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
+  // System Config for synthetic demo payments
+  await db.collection('systemConfig').doc('demoPayment').set({
+    enabled: true,
+    paymentMode: 'demo',
+    allowlist: ['demo-grabngo-local'],
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
   // Pickup slot
   await db.collection('canteens').doc('CANTEEN_NOTIF_A').collection('pickupSlots').doc('SLOT_NOTIF_A1').set({
     slotId: 'SLOT_NOTIF_A1',

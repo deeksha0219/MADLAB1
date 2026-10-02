@@ -17,6 +17,7 @@
 
 import * as admin from 'firebase-admin';
 import * as crypto from 'crypto';
+import { getFirestoreFieldValue } from './notificationOutbox';
 
 // ------------------------------------------------------------------
 // Canonical Notification Types
@@ -236,7 +237,20 @@ function serverTimestamp(): admin.firestore.FieldValue {
       );
     }
 
+    // Read phase: ALL reads must be executed before all writes in Firestore transactions
+    const userRef = db.collection('users').doc(input.recipientUid);
+    const userSnap = await transaction.get(userRef);
+
+    // Write phase:
     transaction.set(notifRef, docPayload);
+
+    // Atomically increment server-maintained unread counter for recipient
+    if (userSnap.exists) {
+      transaction.update(userRef, {
+        unreadNotificationCount: getFirestoreFieldValue().increment(1),
+        updatedAt: serverTimestamp(),
+      });
+    }
 
     return { notificationId, isIdempotent: false };
   } else {
@@ -256,7 +270,20 @@ function serverTimestamp(): admin.firestore.FieldValue {
         );
       }
 
+      // Read phase: read userRef before any writes
+      const userRef = db.collection('users').doc(input.recipientUid);
+      const userSnap = await tx.get(userRef);
+
+      // Write phase:
       tx.set(notifRef, docPayload);
+
+      // Atomically increment server-maintained unread counter for recipient
+      if (userSnap.exists) {
+        tx.update(userRef, {
+          unreadNotificationCount: getFirestoreFieldValue().increment(1),
+          updatedAt: serverTimestamp(),
+        });
+      }
 
       return { notificationId, isIdempotent: false };
     });

@@ -67,6 +67,11 @@ export function configureFirebase(): void {
     console.log(
       `[GrabNGo Firebase] Configured for STAGING project: ${config.projectId}. Live emulators bypassed.`,
     );
+  } else if (config.environment === 'production') {
+    // Production connects to live Cloud Firebase project via google-services.json
+    console.log(
+      `[GrabNGo Firebase] Configured for PRODUCTION project: ${config.projectId}. Live emulators bypassed.`,
+    );
   } else {
     throw new Error(
       `[FIREBASE CONFIG ERROR] Unsupported environment "${(config as any).environment}". Fails closed.`,
