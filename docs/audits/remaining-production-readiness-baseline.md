@@ -69,22 +69,52 @@ The following invariants are inviolable and must remain unchanged:
 
 ---
 
-## 4. Existing Order-State Transitions
+## 4. Existing Order-State & Payment Lifecycle State Machines
 
-The order state machine enforces the following transitions:
+### 4.1 Order Status Transitions (`order.status`)
+The order lifecycle state machine strictly enforces the following server-authoritative transitions:
 
-- `draft` -> `placed` (via `createOrder`)
-- `placed` -> `payment_pending` (when demo payment attempt initiated)
-- `payment_pending` -> `payment_verified` (on successful demo payment or synthetic webhook)
-- `payment_pending` -> `cancelled` (on payment expiry or failure)
-- `placed` -> `accepted` (for cash orders approved by canteen admin or auto-eligible operational transitions)
+- `draft` -> `placed` (created via `createOrder`)
+- `placed` -> `payment_verified` (on successful demo payment via `completeDemoPayment` or verified synthetic webhook)
+- `placed` -> `accepted` (for cash orders approved by canteen admin via `recordCashPaymentApproved` or auto-eligible operational transitions)
 - `payment_verified` -> `accepted` (by canteen admin or operational service desk transition)
 - `accepted` -> `preparing` (by kitchen / service desk)
 - `preparing` -> `ready_for_pickup` (by kitchen / service desk)
 - `ready_for_pickup` -> `completed` (upon handover to student)
-- `placed` / `payment_verified` / `accepted` -> `cancelled` / `rejected` (with pickup slot capacity release)
+- `placed` / `payment_verified` / `accepted` -> `cancelled` / `rejected` (authorized cancellation, with atomic pickup slot capacity release)
 
 Direct client updates to `status` or `statusHistory` are strictly denied by Firestore rules.
+
+### 4.2 Payment Expiry & Attempt Lifecycle (`order.paymentStatus` & Payment State Machine)
+The demo payment state machine enforces strict two-phase commit rules and transaction-safe TTL expiry:
+
+1. **Initial Creation:**
+   - On `createOrder`, `order.status = 'placed'`, `order.paymentStatus = 'pending'`, `order.activePaymentId = null`, `order.activePaymentExpiresAt = null`.
+2. **Payment Attempt Initiation (`createDemoPayment`):**
+   - Creates `/orders/{orderId}/payments/{paymentId}` with `status = 'processing'`.
+   - `order.status` remains `'placed'`.
+   - `order.paymentStatus` transitions to `'processing'`.
+   - `order.activePaymentId` is set to `paymentId` and `order.activePaymentExpiresAt` is set to server TTL timestamp.
+3. **Payment Expiry (`expirePaymentAttempt` or Lazy-Expiry in `createDemoPayment`):**
+   - **Crucial Invariant:** Payment expiry **NEVER** cancels the order. Expiry leaves the order active for retry:
+     - `payment.status` transitions to `'expired'` (`expiredAt` timestamp recorded).
+     - `order.status` remains `'placed'` (NOT cancelled, NOT failed).
+     - `order.paymentStatus` transitions back to `'pending'`.
+     - `order.activePaymentId` is reset to `null`.
+     - `order.activePaymentExpiresAt` is reset to `null`.
+     - `order.failedPaymentCount` is incremented.
+     - **Pickup Slot Capacity:** Slot capacity is **NOT** released on payment expiry; the student's reservation remains secure.
+     - **Retry Capability:** The student can immediately initiate a fresh payment attempt with a new idempotency key.
+4. **Payment Failure (`failDemoPayment` or Synthetic Failure):**
+   - `payment.status = 'failed'`.
+   - `order.status` remains `'placed'`.
+   - `order.paymentStatus = 'failed'`.
+   - `order.activePaymentId = null`.
+5. **Payment Verification (`completeDemoPayment` or Synthetic Webhook):**
+   - `payment.status = 'succeeded_demo'`.
+   - `order.paymentStatus` transitions to `'succeeded_demo'` / `'payment_verified'`.
+   - `order.status` transitions to `'payment_verified'`.
+   - `order.activePaymentId = null` and `order.activePaymentExpiresAt = null`.
 
 ---
 

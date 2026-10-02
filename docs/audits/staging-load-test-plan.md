@@ -54,7 +54,7 @@ Total Load Distribution:
 
 ### Profile C: Demo Payment Lifecycle
 - Operations: `createDemoPayment`, `completeDemoPayment`, synthetic webhook ingestion.
-- Focus: Two-phase commit integrity, order state transition from `payment_pending` to `payment_verified`.
+- Focus: Two-phase commit integrity, order paymentStatus transition from `processing` to `succeeded_demo` / `payment_verified`, and order status to `payment_verified`.
 
 ### Profile D: Notification Worker & Outbox Delivery
 - Operations: Background Cloud Function event triggers, outbox worker processing.
