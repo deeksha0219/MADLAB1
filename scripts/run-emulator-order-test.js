@@ -106,6 +106,14 @@ function assert(condition, message) {
 async function seedFixtures() {
   console.log('\n--- Seeding Initial Step 7 Fixtures ---');
 
+  // Clean previous test orderRequests and cart items for repeatable test runs
+  for (const user of [USERS.studentA, USERS.studentB]) {
+    const reqs = await db.collection('users').doc(user.uid).collection('orderRequests').get();
+    for (const d of reqs.docs) await d.ref.delete();
+    const carts = await db.collection('users').doc(user.uid).collection('cart').get();
+    for (const d of carts.docs) await d.ref.delete();
+  }
+
   // Seed Admin records
   await db.collection('admins').doc('admin_canteen_1_7').set({
     uid: 'admin_canteen_1_7',

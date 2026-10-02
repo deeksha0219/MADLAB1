@@ -121,39 +121,44 @@ service cloud.firestore {
     // canteens/{canteenId}/items/{itemId}/private/{docId}
     // canteens/{canteenId}/pickupSlots/{slotId} (Step 7)
     // ------------------------------------------------------------------------
-    function isCanteenAdmin(canteenId) {
+    function isStaffMember(canteenId) {
       return isAuthenticated()
         && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
         && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.status == 'active'
         && (canteenId in get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.canteenIds);
     }
 
+    function isCanteenAdmin(canteenId) {
+      return isStaffMember(canteenId)
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'canteen_admin';
+    }
+
     match /canteens/{canteenId} {
-      // Authenticated students can read active canteens; assigned admins can read any status
+      // Authenticated students can read active canteens; assigned staff can read any status
       allow read: if isAuthenticated() && (
-        resource.data.isActive == true || isCanteenAdmin(canteenId)
+        resource.data.isActive == true || isStaffMember(canteenId)
       );
       // All writes must go through trusted Cloud Functions
       allow write: if false;
 
       match /categories/{categoryId} {
-        // Authenticated students can read active categories; assigned admins can read any status
+        // Authenticated students can read active categories; assigned staff can read any status
         allow read: if isAuthenticated() && (
-          resource.data.isActive == true || isCanteenAdmin(canteenId)
+          resource.data.isActive == true || isStaffMember(canteenId)
         );
         allow write: if false;
       }
 
       match /items/{itemId} {
-        // Authenticated students can read active & available items; assigned admins can read any status
+        // Authenticated students can read active & available items; assigned staff can read any status
         allow read: if isAuthenticated() && (
           (resource.data.isActive == true && resource.data.isAvailable == true)
-          || isCanteenAdmin(canteenId)
+          || isStaffMember(canteenId)
         );
         allow write: if false;
 
         match /private/{docId} {
-          // Strictly restricted to active canteen admins assigned to this canteen
+          // Strictly restricted to active canteen admins assigned to this canteen (service_desk denied)
           allow read: if isCanteenAdmin(canteenId);
           allow write: if false;
         }
@@ -161,12 +166,17 @@ service cloud.firestore {
 
       // Step 7: Pickup Slots
       match /pickupSlots/{slotId} {
-        // Authenticated users can read open slots; assigned admins can read any slot
+        // Authenticated users can read open slots; assigned staff can read any slot
         allow read: if isAuthenticated() && (
-          resource.data.isOpen == true || isCanteenAdmin(canteenId)
+          resource.data.isOpen == true || isStaffMember(canteenId)
         );
         // Capacity reservation and slot configuration are Cloud Functions / Admin SDK only
         allow write: if false;
+
+        // Phase 4B: Capacity Shards (Server-Only)
+        match /capacityShards/{shardId} {
+          allow read, write: if false;
+        }
       }
     }
 
@@ -175,12 +185,10 @@ service cloud.firestore {
     // orders/{orderId}
     // ------------------------------------------------------------------------
     match /orders/{orderId} {
-      // Students can read ONLY their own orders
-      // Assigned active admins can read orders for their assigned canteens
-      allow read: if isAuthenticated() && (
-        resource.data.studentUid == request.auth.uid
-        || isCanteenAdmin(resource.data.canteenId)
-      );
+      // Students can read ONLY their own orders (safe client order history tracking)
+      // Direct raw order reads by staff/service desk are strictly DENIED to prevent bypassing operational masking
+      // Operational staff must access orders via sanitized Cloud Functions (listOperationalOrders, etc.)
+      allow read: if isAuthenticated() && resource.data.studentUid == request.auth.uid;
 
       // All order creation, updates, and deletes are strictly prohibited from client devices
       // Order creation & status transitions are brokered exclusively via Cloud Functions
@@ -192,11 +200,9 @@ service cloud.firestore {
       // ----------------------------------------------------------------------
       match /statusHistory/{eventId} {
         // Students can read history for their own orders
-        // Assigned active admins can read history for assigned canteens
-        allow read: if isAuthenticated() && (
-          get(/databases/$(database)/documents/orders/$(orderId)).data.studentUid == request.auth.uid
-          || isCanteenAdmin(get(/databases/$(database)/documents/orders/$(orderId)).data.canteenId)
-        );
+        // Direct reads by staff/service desk are strictly DENIED to enforce callable masking
+        allow read: if isAuthenticated() &&
+          get(/databases/$(database)/documents/orders/$(orderId)).data.studentUid == request.auth.uid;
 
         // Direct client writes are strictly denied (Cloud Functions only)
         allow write: if false;
@@ -257,6 +263,13 @@ service cloud.firestore {
     // Notification Events Collection (Step 10 Server-Only Events)
     // ------------------------------------------------------------------------
     match /notificationEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Notification Outbox Collection (Phase 3 Server-Only Outbox)
+    // ------------------------------------------------------------------------
+    match /notificationOutbox/{outboxId} {
       allow read, write: if false;
     }
 

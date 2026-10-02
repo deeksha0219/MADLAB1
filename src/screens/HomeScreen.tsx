@@ -8,7 +8,9 @@ import MaterialIcon from "react-native-vector-icons/MaterialIcons";
 import { home as Homestyles } from "../styles/Studentstyles";
 import { useNavigation } from "@react-navigation/native";
 import firestore from "@react-native-firebase/firestore";
+import auth from "@react-native-firebase/auth";
 import { getActiveCanteens, Canteen } from "../services/catalogService";
+import { setUserCartItem, removeUserCartItem } from "../services/orderService";
 import NotificationBell from "../components/NotificationBell";
 
 export default function HomeScreen() {
@@ -43,12 +45,13 @@ export default function HomeScreen() {
     loadCanteens();
   }, []);
 
-  // ✅ FETCH UNAVAILABLE ITEMS FROM FIRESTORE
+  // ✅ FETCH UNAVAILABLE ITEMS FROM CANTEEN CATALOG
   useEffect(() => {
     const unsubscribe = firestore()
-      .collection("menu")
-      .where("available", "==", false)
-      .where("canteen", "==", "BIG_MINGOS")
+      .collection("canteens")
+      .doc("BIG_MINGOS")
+      .collection("items")
+      .where("isAvailable", "==", false)
       .onSnapshot(snap => {
         const names = snap.docs.map(doc => doc.data().name);
         setUnavailableItems(names);
@@ -56,48 +59,58 @@ export default function HomeScreen() {
     return () => unsubscribe();
   }, []);
 
-  // ✅ SYNC CART QUANTITIES FROM FIRESTORE
+  // ✅ SYNC CART QUANTITIES FROM USER-SCOPED CART
   useEffect(() => {
+    const currentUid = auth().currentUser?.uid;
+    if (!currentUid) {
+      setQuantities({});
+      return;
+    }
     const unsubscribe = firestore()
+      .collection("users")
+      .doc(currentUid)
       .collection("cart")
       .onSnapshot(snap => {
         const qtys: { [key: string]: number } = {};
         snap.docs.forEach(doc => {
           const data = doc.data();
-          qtys[data.name] = data.quantity;
+          qtys[doc.id] = data.quantity;
+          if (data.name) qtys[data.name] = data.quantity;
         });
         setQuantities(qtys);
       });
     return () => unsubscribe();
   }, []);
 
-  const increaseQty = async (name: string, price: number) => {
+  const increaseQty = async (itemId: string, name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        await cartRef.doc(doc.id).update({ quantity: doc.data().quantity + 1 });
-      } else {
-        await cartRef.add({ name, price, quantity: 1 });
-      }
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current >= 99) return;
+      await setUserCartItem(currentUid, {
+        itemId,
+        canteenId: "BIG_MINGOS",
+        quantity: current + 1,
+      });
     } catch (err) {
       console.log("Error adding to cart:", err);
     }
   };
 
-  const decreaseQty = async (name: string) => {
+  const decreaseQty = async (itemId: string, name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        const qty = doc.data().quantity;
-        if (qty <= 1) {
-          await cartRef.doc(doc.id).delete();
-        } else {
-          await cartRef.doc(doc.id).update({ quantity: qty - 1 });
-        }
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current <= 1) {
+        await removeUserCartItem(currentUid, itemId);
+      } else {
+        await setUserCartItem(currentUid, {
+          itemId,
+          canteenId: "BIG_MINGOS",
+          quantity: current - 1,
+        });
       }
     } catch (err) {
       console.log("Error decreasing cart:", err);
@@ -154,7 +167,9 @@ export default function HomeScreen() {
     : [];
 
   const renderFoodCard = (item: any) => {
+    const itemId = item.id || `demo_${item.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
     const isUnavailable = unavailableItems.includes(item.name) && selectedCanteen === "BIG MINGOS";
+    const currentQty = quantities[itemId] || quantities[item.name] || 0;
     return (
       <View key={item.name} style={[Homestyles.card, isUnavailable && { opacity: 0.4 }]}>
         <View style={{ flex: 1 }}>
@@ -166,13 +181,13 @@ export default function HomeScreen() {
             </Text>
           ) : (
             <View style={Homestyles.priceRow}>
-              <TouchableOpacity style={Homestyles.qtyBtn} onPress={() => decreaseQty(item.name)}>
+              <TouchableOpacity style={Homestyles.qtyBtn} onPress={() => decreaseQty(itemId, item.name)}>
                 <Text>-</Text>
               </TouchableOpacity>
               <Text style={Homestyles.price}>
-                ₹{item.price} ({quantities[item.name] || 0})
+                ₹{item.price} ({currentQty})
               </Text>
-              <TouchableOpacity style={Homestyles.qtyBtn} onPress={() => increaseQty(item.name, item.price)}>
+              <TouchableOpacity style={Homestyles.qtyBtn} onPress={() => increaseQty(itemId, item.name)}>
                 <Text>+</Text>
               </TouchableOpacity>
             </View>

@@ -111,6 +111,16 @@ function assert(condition, message) {
 async function seedTestData() {
   console.log('--- Seeding Test Data for Step 9 ---');
 
+  for (const user of [USERS.studentA, USERS.studentB]) {
+    const payReqs = await db.collection('users').doc(user.uid).collection('paymentRequests').get();
+    for (const d of payReqs.docs) await d.ref.delete();
+    const carts = await db.collection('users').doc(user.uid).collection('cart').get();
+    for (const d of carts.docs) await d.ref.delete();
+  }
+
+  const webhookEvents = await db.collection('webhookEvents').get();
+  for (const d of webhookEvents.docs) await d.ref.delete();
+
   // Seed Admin profiles
   await db.collection('admins').doc(USERS.admin1.uid).set({
     uid: USERS.admin1.uid,
@@ -244,6 +254,12 @@ async function runAllTests() {
       reason: 'Order placed',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // Clean up any subcollections from previous runs for clean test repeatability
+    const oldPayments = await orderRef.collection('payments').get();
+    for (const d of oldPayments.docs) await d.ref.delete();
+    const oldHistory = await orderRef.collection('paymentHistory').get();
+    for (const d of oldHistory.docs) await d.ref.delete();
 
     return orderRef;
   }
@@ -791,7 +807,7 @@ async function runAllTests() {
     }
 
     // 5. Wrong order ID rejected
-    const wrongOrderPayload = { ...validPayload, orderId: 'NON_EXISTENT_ORDER' };
+    const wrongOrderPayload = { ...validPayload, eventId: 'EVT-SYNTHETIC-WRONG-ORDER', orderId: 'NON_EXISTENT_ORDER' };
     const wrongOrderRaw = JSON.stringify(wrongOrderPayload);
     const wrongOrderHmac = crypto.createHmac('sha256', syntheticSecret).update(wrongOrderRaw).digest('hex');
     try {
@@ -804,7 +820,7 @@ async function runAllTests() {
     }
 
     // 6. Wrong payment ID rejected
-    const wrongPaymentPayload = { ...validPayload, paymentId: 'NON_EXISTENT_PAYMENT' };
+    const wrongPaymentPayload = { ...validPayload, eventId: 'EVT-SYNTHETIC-WRONG-PAYMENT', paymentId: 'NON_EXISTENT_PAYMENT' };
     const wrongPaymentRaw = JSON.stringify(wrongPaymentPayload);
     const wrongPaymentHmac = crypto.createHmac('sha256', syntheticSecret).update(wrongPaymentRaw).digest('hex');
     try {

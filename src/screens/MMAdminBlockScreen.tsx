@@ -16,6 +16,9 @@ import { home } from "../styles/Studentstyles";
 import { useNavigation } from "@react-navigation/native";
 import firestore from "@react-native-firebase/firestore";
 
+import auth from "@react-native-firebase/auth";
+import { setUserCartItem, removeUserCartItem } from "../services/orderService";
+
 export default function MMAdminBlockScreen() {
   const navigation = useNavigation<any>();
 
@@ -25,32 +28,39 @@ export default function MMAdminBlockScreen() {
   const [quantities, setQuantities] = useState<{ [key: string]: number }>({});
 
   useEffect(() => {
+    const currentUid = auth().currentUser?.uid;
+    if (!currentUid) {
+      setQuantities({});
+      return;
+    }
     const unsubscribe = firestore()
+      .collection("users")
+      .doc(currentUid)
       .collection("cart")
       .onSnapshot(snap => {
         const qtys: any = {};
         snap.docs.forEach(doc => {
           const data = doc.data();
-          qtys[data.name] = data.quantity;
+          qtys[doc.id] = data.quantity;
+          if (data.name) qtys[data.name] = data.quantity;
         });
         setQuantities(qtys);
       });
     return () => unsubscribe();
   }, []);
 
-  const increaseQty = async (name: string, price: number) => {
+  const increaseQty = async (name: string, _price?: number) => {
     try {
-      const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
-
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        await cartRef.doc(doc.id).update({
-          quantity: doc.data().quantity + 1,
-        });
-      } else {
-        await cartRef.add({ name, price, quantity: 1 });
-      }
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const itemId = `mm_admin_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current >= 99) return;
+      await setUserCartItem(currentUid, {
+        itemId,
+        canteenId: "MM_ADMIN_BLOCK",
+        quantity: current + 1,
+      });
     } catch (err) {
       console.log("Error:", err);
     }
@@ -58,18 +68,18 @@ export default function MMAdminBlockScreen() {
 
   const decreaseQty = async (name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
-
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        const qty = doc.data().quantity;
-
-        if (qty <= 1) {
-          await cartRef.doc(doc.id).delete();
-        } else {
-          await cartRef.doc(doc.id).update({ quantity: qty - 1 });
-        }
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const itemId = `mm_admin_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current <= 1) {
+        await removeUserCartItem(currentUid, itemId);
+      } else {
+        await setUserCartItem(currentUid, {
+          itemId,
+          canteenId: "MM_ADMIN_BLOCK",
+          quantity: current - 1,
+        });
       }
     } catch (err) {
       console.log(err);

@@ -103,6 +103,16 @@ async function runRealRulesEmulatorTests() {
         updatedAt: now,
       });
 
+      // Service Desk Operator (assigned to BIG_MINGOS)
+      await adminDb.collection('admins').doc('desk_canteen_1').set({
+        uid: 'desk_canteen_1',
+        role: 'service_desk',
+        canteenIds: ['BIG_MINGOS'],
+        status: 'active',
+        createdAt: now,
+        updatedAt: now,
+      });
+
       // Canteens
       await adminDb.collection('canteens').doc('BIG_MINGOS').set({
         name: 'BIG MINGOS',
@@ -180,6 +190,23 @@ async function runRealRulesEmulatorTests() {
         sortOrder: 99,
         createdAt: now,
         updatedAt: now,
+      });
+
+      // Test order fixture for direct read/write security tests
+      await adminDb.collection('orders').doc('order_test_1').set({
+        orderId: 'order_test_1',
+        studentUid: 'student_alice',
+        canteenId: 'BIG_MINGOS',
+        status: 'placed',
+        paymentStatus: 'pending',
+        totalInPaise: 12000,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await adminDb.collection('orders').doc('order_test_1').collection('statusHistory').doc('ev_placed').set({
+        eventId: 'ev_placed',
+        toStatus: 'placed',
+        createdAt: now,
       });
     });
 
@@ -351,6 +378,33 @@ async function runRealRulesEmulatorTests() {
       await assertFails(db.collection('canteens').doc('BIG_MINGOS').collection('items').doc('dosa_01').collection('private').doc('admin').get());
     });
 
+    // --- SEC-03: Role Separation & Service Desk Authorization ---
+    await runTest('SEC-03: Active service_desk assigned to Canteen A reading private/admin subcollection is DENIED', async () => {
+      const db = testEnv.authenticatedContext('desk_canteen_1').firestore();
+      await assertFails(db.collection('canteens').doc('BIG_MINGOS').collection('items').doc('dosa_01').collection('private').doc('admin').get());
+    });
+
+    await runTest('SEC-03: Active service_desk assigned to Canteen A can read unavailable items in own canteen', async () => {
+      const db = testEnv.authenticatedContext('desk_canteen_1').firestore();
+      await assertSucceeds(db.collection('canteens').doc('BIG_MINGOS').collection('items').doc('samosa_01').get());
+    });
+
+    await runTest('SEC-03: Active service_desk assigned to Canteen A can read inactive items in own canteen', async () => {
+      const db = testEnv.authenticatedContext('desk_canteen_1').firestore();
+      await assertSucceeds(db.collection('canteens').doc('BIG_MINGOS').collection('items').doc('secret_01').get());
+    });
+
+    await runTest('SEC-03: Active service_desk reading private data of UNASSIGNED canteen is DENIED', async () => {
+      // desk_canteen_1 is assigned to BIG_MINGOS, not ADMIN_BLOCK_CANTEEN
+      const db = testEnv.authenticatedContext('desk_canteen_1').firestore();
+      await assertFails(db.collection('canteens').doc('ADMIN_BLOCK_CANTEEN').collection('items').doc('item_01').collection('private').doc('admin').get());
+    });
+
+    await runTest('SEC-03: Active service_desk direct write to private/admin subcollection is DENIED', async () => {
+      const db = testEnv.authenticatedContext('desk_canteen_1').firestore();
+      await assertFails(db.collection('canteens').doc('BIG_MINGOS').collection('items').doc('dosa_01').collection('private').doc('admin').set({ costPrice: 100 }));
+    });
+
     await runTest('Direct client write by admin is DENIED (enforcing Cloud Functions write path)', async () => {
       const db = testEnv.authenticatedContext('admin_canteen_1').firestore();
       await assertFails(db.collection('canteens').doc('BIG_MINGOS').collection('items').doc('dosa_01').update({
@@ -394,6 +448,34 @@ async function runRealRulesEmulatorTests() {
       const db = testEnv.authenticatedContext('student_alice').firestore();
       await assertFails(db.collection('webhookEvents').doc('demo:evt_001').get());
     });
+
+    console.log('\n--- R-04: Order Direct Read Rules & Staff Masking Protection ---');
+
+    await runTest('Student reading own order document directly is ALLOWED', async () => {
+      const db = testEnv.authenticatedContext('student_alice').firestore();
+      await assertSucceeds(db.collection('orders').doc('order_test_1').get());
+    });
+
+    await runTest('Student reading another student order document directly is DENIED', async () => {
+      const db = testEnv.authenticatedContext('student_bob').firestore();
+      await assertFails(db.collection('orders').doc('order_test_1').get());
+    });
+
+    await runTest('R-04: Active service_desk direct raw order read is DENIED (enforcing callable masking)', async () => {
+      const db = testEnv.authenticatedContext('desk_canteen_1').firestore();
+      await assertFails(db.collection('orders').doc('order_test_1').get());
+    });
+
+    await runTest('R-04: Active service_desk direct statusHistory read is DENIED (enforcing callable masking)', async () => {
+      const db = testEnv.authenticatedContext('desk_canteen_1').firestore();
+      await assertFails(db.collection('orders').doc('order_test_1').collection('statusHistory').doc('ev_placed').get());
+    });
+
+    await runTest('R-04: Active canteen_admin direct raw order read is DENIED (enforcing callable masking)', async () => {
+      const db = testEnv.authenticatedContext('admin_canteen_1').firestore();
+      await assertFails(db.collection('orders').doc('order_test_1').get());
+    });
+
 
   } finally {
     await testEnv.cleanup();

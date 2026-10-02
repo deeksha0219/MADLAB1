@@ -32,7 +32,6 @@ local.properties
 *.hprof
 .cxx/
 *.keystore
-!debug.keystore
 .kotlin/
 
 # node.js
@@ -90,3 +89,8 @@ firestore-debug.log*
 ui-debug.log*
 pubsub-debug.log*
 database-debug.log*
+
+# Local development service desk kiosk harness
+web/
+audit-root.json
+audit-functions.json

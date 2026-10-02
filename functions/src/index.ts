@@ -19,6 +19,16 @@ import {
   createNotificationInternal,
   notifyAssignedCanteenAdmins,
 } from './notifications/notificationService';
+import { writeNotificationOutboxTx } from './notifications/notificationOutbox';
+export { processNotificationOutbox } from './notifications/notificationWorker';
+import {
+  computeShardCapacities,
+  planSlotReservationTx,
+  executeSlotReservationTx,
+  planSlotReleaseTx,
+  executeSlotReleaseTx,
+  SlotReleasePlan,
+} from './slots/slotSharding';
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -254,22 +264,38 @@ export const assignAdminRole = functions.https.onCall(
       );
     }
 
-    // 2. Authorization check:
-    // Requires caller to possess an existing active admin document in Firestore,
-    // OR strictly running inside the local Firebase Functions Emulator.
+    // 2. Authorization check (R-02 Hardening):
+    // Staging and production strictly require an active platform_operator document.
+    // Local emulator allows initial bootstrap when FUNCTIONS_EMULATOR is 'true'.
     const isEmulator = process.env.FUNCTIONS_EMULATOR === 'true';
 
-    let isCallerAdmin = false;
+    let isCallerPlatformOperator = false;
+    let callerRole = 'unauthenticated';
     if (context.auth && context.auth.uid) {
       const callerDoc = await db.collection('admins').doc(context.auth.uid).get();
-      isCallerAdmin = callerDoc.exists && callerDoc.data()?.status === 'active';
+      if (callerDoc.exists && callerDoc.data()?.status === 'active') {
+        const callerData = callerDoc.data()!;
+        callerRole = callerData.role || 'canteen_admin';
+        isCallerPlatformOperator =
+          callerData.role === 'platform_operator' || callerData.isOperator === true;
+      }
     }
 
-    if (!isCallerAdmin && !isEmulator) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'Administrative authorization required. Unprivileged clients cannot assign admin roles.',
-      );
+    if (!isCallerPlatformOperator) {
+      if (!isEmulator) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'Platform Operator authorization required. Ordinary administrators and service desk attendants cannot assign admin roles.',
+        );
+      }
+      // If running inside emulator, allow initial bootstrap only if unauthenticated or bootstrap caller
+      // but strictly reject non-operator authenticated staff (canteen_admin, service_desk)
+      if (context.auth && context.auth.uid && !isCallerPlatformOperator) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          `Role '${callerRole}' cannot assign admin roles. Platform Operator authority required.`,
+        );
+      }
     }
 
     const adminRef = db.collection('admins').doc(targetUid);
@@ -284,10 +310,26 @@ export const assignAdminRole = functions.https.onCall(
 
     await adminRef.set(adminRecord, { merge: true });
 
-    // Assign custom claims for token-level validation
-    await admin.auth().setCustomUserClaims(targetUid, {
-      role: 'canteen_admin',
+    // Assign custom claims for token-level validation if Auth record exists
+    try {
+      await admin.auth().setCustomUserClaims(targetUid, {
+        role: 'canteen_admin',
+        canteenIds,
+      });
+    } catch (err: any) {
+      functions.logger.warn(`[assignAdminRole] setCustomUserClaims non-fatal for ${targetUid}:`, err?.message);
+    }
+
+    // Create an auditable role-assignment event
+    await db.collection('adminAuditEvents').add({
+      eventType: 'admin_role_assigned',
+      targetUid,
+      assignedRole: 'canteen_admin',
       canteenIds,
+      assignedByUid: context.auth?.uid || 'emulator_bootstrap',
+      assignedByRole: isCallerPlatformOperator ? 'platform_operator' : 'emulator_bootstrap',
+      isEmulatorBootstrap: !isCallerPlatformOperator && isEmulator,
+      createdAt: serverTimestamp(),
     });
 
     return {
@@ -433,6 +475,175 @@ export async function verifyOperationalAccess(
 
   return { uid: callerUid, role, canteenIds: assignedCanteens };
 }
+
+/**
+ * Centralized Role Helpers (R-01 Hardening)
+ */
+export function requireAuthenticatedUser(context: functions.https.CallableContext): string {
+  if (!context.auth || !context.auth.uid) {
+    throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+  }
+  return context.auth.uid;
+}
+
+export async function requireActivePlatformOperator(
+  context: functions.https.CallableContext,
+): Promise<{ uid: string; role: OperationalRole; canteenIds: string[] }> {
+  return await verifyOperationalAccess(context, undefined, ['platform_operator']);
+}
+
+export async function requireActiveCanteenAdmin(
+  context: functions.https.CallableContext,
+  canteenId?: string,
+): Promise<{ uid: string; role: OperationalRole; canteenIds: string[] }> {
+  return await verifyOperationalAccess(context, canteenId, ['platform_operator', 'canteen_admin']);
+}
+
+export async function requireActiveServiceDesk(
+  context: functions.https.CallableContext,
+  canteenId?: string,
+): Promise<{ uid: string; role: OperationalRole; canteenIds: string[] }> {
+  return await verifyOperationalAccess(context, canteenId, ['platform_operator', 'service_desk']);
+}
+
+export async function requireActiveStaff(
+  context: functions.https.CallableContext,
+  canteenId?: string,
+): Promise<{ uid: string; role: OperationalRole; canteenIds: string[] }> {
+  return await verifyOperationalAccess(context, canteenId, [
+    'platform_operator',
+    'canteen_admin',
+    'service_desk',
+  ]);
+}
+
+export function requireStudentOrderOwner(
+  context: functions.https.CallableContext,
+  orderStudentUid: string,
+): string {
+  const uid = requireAuthenticatedUser(context);
+  if (uid !== orderStudentUid) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Caller is not the student owner of this order.',
+    );
+  }
+  return uid;
+}
+
+/**
+ * Helper to verify caller has financial authorization for an order.
+ * Strictly excludes service_desk!
+ * Allows student owner (if allowStudentOwner is true) or active canteen_admin / platform_operator.
+ */
+export async function verifyFinancialAuthorization(
+  callerUid: string,
+  orderData: Record<string, any>,
+  allowStudentOwner: boolean = true,
+  transaction?: FirebaseFirestore.Transaction,
+): Promise<{ isStudentOwner: boolean; isAdmin: boolean }> {
+  const isStudentOwner = allowStudentOwner && orderData.studentUid === callerUid;
+  if (isStudentOwner) {
+    return { isStudentOwner: true, isAdmin: false };
+  }
+
+  const adminRef = db.collection('admins').doc(callerUid);
+  const adminSnap = transaction ? await transaction.get(adminRef) : await adminRef.get();
+
+  if (!adminSnap.exists || adminSnap.data()?.status !== 'active') {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Caller is not authorized to perform financial operations for this order.',
+    );
+  }
+
+  const adminData = adminSnap.data()!;
+  const role = adminData.role;
+
+  // STRICT RULE: service_desk role is NEVER authorized for financial mutations or payment details
+  if (role === 'service_desk') {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Service desk attendants are strictly unauthorized for payment and refund operations.',
+    );
+  }
+
+  const isOperator = adminData.isOperator === true || role === 'platform_operator';
+  const isCanteenAdmin =
+    role === 'canteen_admin' &&
+    Array.isArray(adminData.canteenIds) &&
+    adminData.canteenIds.includes(orderData.canteenId);
+
+  if (!isOperator && !isCanteenAdmin) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Caller is not authorized for financial operations in this canteen.',
+    );
+  }
+
+  return { isStudentOwner: false, isAdmin: true };
+}
+
+/**
+ * Canonical helper: Determines if an order is operationally eligible for service-desk fulfillment.
+ * Centralized business rules:
+ * 1. Online orders must have verified payment approval (status 'payment_verified' or paymentStatus 'succeeded_demo').
+ * 2. Cash orders must have explicit backend/admin payment verification (status 'payment_verified', paymentStatus 'payment_verified').
+ * 3. Pending, failed, expired, cancelled, rejected, or unapproved orders (cash or online) remain hidden from service desk.
+ */
+export function isOrderOperationallyEligible(order: Record<string, any>): boolean {
+  if (!order) return false;
+
+  const status = order.status;
+  const paymentStatus = order.paymentStatus;
+  const refundStatus = order.refundStatus;
+
+  // Never eligible if refund is pending, completed, or requested
+  if (refundStatus && refundStatus !== 'not_requested') {
+    return false;
+  }
+
+  // Never eligible if payment failed, expired, or pending (applies to both cash and online)
+  if (paymentStatus === 'failed' || paymentStatus === 'expired' || paymentStatus === 'pending') {
+    return false;
+  }
+
+  // Terminal/non-fulfillable statuses: cancelled or rejected orders are excluded from service desk
+  if (status === 'cancelled' || status === 'rejected') {
+    return false;
+  }
+
+  // If status is placed: unapproved/unverified orders are never eligible regardless of paymentMethod
+  if (status === 'placed') {
+    return false;
+  }
+
+  // Payment must be explicitly verified (payment_verified or succeeded_demo)
+  const isPaymentVerified =
+    paymentStatus === 'payment_verified' ||
+    paymentStatus === 'succeeded_demo';
+  if (!isPaymentVerified) {
+    return false;
+  }
+
+  // Active operational statuses (after payment verification and acceptance)
+  if (['payment_verified', 'accepted', 'preparing', 'ready_for_pickup', 'completed'].includes(status)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Determines whether an order is in the incoming/pending queue awaiting staff acceptance.
+ * Decreases when an order leaves pending/incoming (e.g. accepted).
+ */
+export function isOrderIncomingEligible(order: Record<string, any>): boolean {
+  if (!isOrderOperationallyEligible(order)) return false;
+  // Incoming/pending orders are those that have verified payment but have not yet been accepted by counter staff
+  return order.status === 'payment_verified';
+}
+
 
 function validatePriceInPaise(price: any): number {
   if (
@@ -986,7 +1197,7 @@ export const createPickupSlot = functions.https.onCall(
   async (data: Record<string, any>, context) => {
     rejectUnknownFields(
       data,
-      ['canteenId', 'slotId', 'date', 'startTime', 'endTime', 'capacity', 'isOpen'],
+      ['canteenId', 'slotId', 'date', 'startTime', 'endTime', 'capacity', 'isOpen', 'isSharded', 'shardCount'],
       'createPickupSlot',
     );
     const canteenId = validateId(data.canteenId, 'canteenId');
@@ -1023,38 +1234,147 @@ export const createPickupSlot = functions.https.onCall(
     const capacity = typeof data.capacity === 'number' ? data.capacity : 30;
     const isOpen = data.isOpen !== false;
 
+    if (data.isSharded !== undefined && typeof data.isSharded !== 'boolean') {
+      throw new functions.https.HttpsError('invalid-argument', 'isSharded must be a boolean.');
+    }
+    const isSharded = data.isSharded === true;
+    let shardCount: number | undefined = undefined;
+    if (isSharded) {
+      if (data.shardCount !== undefined) {
+        if (
+          typeof data.shardCount !== 'number' ||
+          !Number.isInteger(data.shardCount) ||
+          data.shardCount < 1 ||
+          data.shardCount > 20
+        ) {
+          throw new functions.https.HttpsError(
+            'invalid-argument',
+            'shardCount must be an integer between 1 and 20.',
+          );
+        }
+        shardCount = data.shardCount;
+      } else {
+        shardCount = 5;
+      }
+    }
+
     const slotRef = db.collection('canteens').doc(canteenId).collection('pickupSlots').doc(slotId);
-    await slotRef.set({
-      slotId,
-      canteenId,
-      date: data.date,
-      startTime: data.startTime,
-      endTime: data.endTime,
-      timezone: 'Asia/Kolkata',
-      isOpen,
-      capacity,
-      reservedCount: 0,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+
+    if (isSharded && shardCount) {
+      const shardCapacities = computeShardCapacities(capacity, shardCount);
+      const batch = db.batch();
+      batch.set(slotRef, {
+        slotId,
+        canteenId,
+        date: data.date,
+        startTime: data.startTime,
+        endTime: data.endTime,
+        timezone: 'Asia/Kolkata',
+        isOpen,
+        capacity,
+        reservedCount: 0,
+        isSharded: true,
+        shardCount,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      for (let i = 0; i < shardCount; i++) {
+        const shardId = `shard_${i}`;
+        const shardRef = slotRef.collection('capacityShards').doc(shardId);
+        batch.set(shardRef, {
+          shardId,
+          slotId,
+          canteenId,
+          allocatedCapacity: shardCapacities[i],
+          reservedCount: 0,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      await batch.commit();
+    } else {
+      await slotRef.set({
+        slotId,
+        canteenId,
+        date: data.date,
+        startTime: data.startTime,
+        endTime: data.endTime,
+        timezone: 'Asia/Kolkata',
+        isOpen,
+        capacity,
+        reservedCount: 0,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
     return { success: true, slotId };
   },
 );
 
 /**
- * Callable Function: createOrder (Step 7)
+ * Non-invasive order telemetry interface (Phase 5).
+ * Captures request latency, transaction retries, aborts, and errors.
+ * Strictly strips all customer PII, secrets, auth tokens, and raw payloads.
+ */
+interface OrderTelemetryEntry {
+  correlationId: string;
+  operation: string;
+  orderId?: string;
+  canteenId?: string;
+  isRetry?: boolean;
+  reservationMode?: 'sharded' | 'legacy';
+  shardId?: string;
+  itemCount?: number;
+  totalDurationMs?: number;
+  transactionDurationMs?: number;
+  transactionAttempts?: number;
+  abortCategory?: string;
+  errorCategory?: string;
+  status: 'success' | 'aborted' | 'error';
+}
+
+function logOrderTelemetry(entry: OrderTelemetryEntry): void {
+  functions.logger.info('[OrderTelemetry]', JSON.stringify({
+    timestamp: new Date().toISOString(),
+    correlationId: entry.correlationId || 'none',
+    operation: entry.operation,
+    orderId: entry.orderId || 'none',
+    canteenId: entry.canteenId || 'none',
+    isRetry: Boolean(entry.isRetry),
+    reservationMode: entry.reservationMode || 'unknown',
+    shardId: entry.shardId || 'none',
+    itemCount: entry.itemCount ?? 0,
+    totalDurationMs: entry.totalDurationMs ?? 0,
+    transactionDurationMs: entry.transactionDurationMs ?? 0,
+    transactionAttempts: entry.transactionAttempts ?? 1,
+    abortCategory: entry.abortCategory || 'none',
+    errorCategory: entry.errorCategory || 'none',
+    status: entry.status,
+  }));
+}
+
+/**
+ * Callable Function: createOrder (Step 7 / Phase 5 High-Scale Ingestion)
  *
  * Core Security & Invariance:
  * 1. Client sends only validated intent: canteenId, items: [{itemId, quantity}], pickupSlotId, paymentMethod, idempotencyKey.
  * 2. Reject all client-supplied price, unitPrice, lineTotal, subtotal, total, status, or timestamps.
  * 3. Authoritative prices are re-read from Firestore catalog inside an atomic transaction.
- * 4. Slot capacity is checked and reserved transactionally.
+ * 4. Slot capacity is checked and reserved transactionally (supports Strategy A sharded slots & legacy slots).
  * 5. Submitted cart items in users/{studentUid}/cart/{itemId} are cleared in the same transaction.
  * 6. Deterministic orderId derived from studentUid and idempotencyKey.
  * 7. ALL transaction reads execute BEFORE any transaction writes.
+ * 8. Non-invasive telemetry tracks latency, transaction holding time, and abort categories.
  */
 export const createOrder = functions.https.onCall(
   async (data: Record<string, any>, context) => {
+    const requestStartTime = Date.now();
+    let transactionAttempts = 0;
+    let txStartTime = 0;
+    let chosenReservationMode: 'sharded' | 'legacy' = 'legacy';
+    let chosenShardId: string | undefined;
+
     // 1. Authentication
     if (!context.auth || !context.auth.uid) {
       throw new functions.https.HttpsError(
@@ -1064,12 +1384,47 @@ export const createOrder = functions.https.onCall(
     }
     const studentUid = context.auth.uid;
 
-    // 2. Reject unknown / forbidden fields
+    // 2. Pre-validation: Input object shape & static request size bounds
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'Request payload must be a non-null object.',
+      );
+    }
+
+    try {
+      const payloadString = JSON.stringify(data);
+      if (payloadString.length > 32768) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'Request payload exceeds maximum allowed size of 32KB.',
+        );
+      }
+    } catch (err: any) {
+      if (err instanceof functions.https.HttpsError) throw err;
+      throw new functions.https.HttpsError('invalid-argument', 'Malformed request payload.');
+    }
+
+    // Reject unknown / forbidden fields
     rejectUnknownFields(
       data,
       ['canteenId', 'items', 'pickupSlotId', 'paymentMethod', 'idempotencyKey'],
       'createOrder',
     );
+
+    // Validate mandatory fields
+    if (
+      !data.canteenId ||
+      !data.items ||
+      !data.pickupSlotId ||
+      !data.paymentMethod ||
+      !data.idempotencyKey
+    ) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'canteenId, items, pickupSlotId, paymentMethod, and idempotencyKey are mandatory.',
+      );
+    }
 
     // 3. Validate canteenId
     const canteenId = validateId(data.canteenId, 'canteenId');
@@ -1115,6 +1470,7 @@ export const createOrder = functions.https.onCall(
 
     const seenItemIds = new Set<string>();
     const sanitizedItems: Array<{ itemId: string; quantity: number }> = [];
+    let totalOrderQuantity = 0;
 
     for (const item of data.items) {
       if (!item || typeof item !== 'object') {
@@ -1144,7 +1500,15 @@ export const createOrder = functions.https.onCall(
           `Item ${itemId} quantity must be an integer between 1 and 99.`,
         );
       }
+      totalOrderQuantity += item.quantity;
       sanitizedItems.push({ itemId, quantity: item.quantity });
+    }
+
+    if (totalOrderQuantity > 200) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'Total quantity across all items cannot exceed 200 per order.',
+      );
     }
 
     // Compute canonical request hash
@@ -1173,314 +1537,369 @@ export const createOrder = functions.https.onCall(
     const canteenRef = db.collection('canteens').doc(canteenId);
     const slotRef = canteenRef.collection('pickupSlots').doc(pickupSlotId);
 
-    // 8. Execute Firestore Transaction: ALL READS FIRST, THEN ALL WRITES
-    const result = await db.runTransaction(async (transaction) => {
-      // --- READ 1: Idempotency Record ---
-      const existingReq = await transaction.get(idempotencyRef);
-      if (existingReq.exists) {
-        const reqData = existingReq.data()!;
-        if (reqData.requestHash === requestHash) {
-          // Idempotent retry: read existing order and return
-          const existingOrder = await transaction.get(orderRef);
-          if (existingOrder.exists) {
-            const ordData = existingOrder.data()!;
-            return {
-              isRetry: true,
-              orderId: ordData.orderId,
-              status: ordData.status,
-              paymentStatus: ordData.paymentStatus,
-              totalInPaise: ordData.totalInPaise,
-              subtotalInPaise: ordData.subtotalInPaise,
-              pickupSlot: ordData.pickupSlot,
-              itemsSnapshot: ordData.itemsSnapshot,
-            };
+    // 8. Execute Firestore Transaction with telemetry and optimized concurrent reads
+    try {
+      const result = await db.runTransaction(async (transaction) => {
+        transactionAttempts++;
+        txStartTime = Date.now();
+
+        // --- READ 1: Idempotency Record (Fast short-circuit on retry) ---
+        const existingReq = await transaction.get(idempotencyRef);
+        if (existingReq.exists) {
+          const reqData = existingReq.data()!;
+          if (reqData.requestHash === requestHash) {
+            // Idempotent retry: read existing order and return immediately without reading catalog/slot/cart
+            const existingOrder = await transaction.get(orderRef);
+            if (existingOrder.exists) {
+              const ordData = existingOrder.data()!;
+              return {
+                isRetry: true,
+                orderId: ordData.orderId,
+                status: ordData.status,
+                paymentStatus: ordData.paymentStatus,
+                totalInPaise: ordData.totalInPaise,
+                subtotalInPaise: ordData.subtotalInPaise,
+                pickupSlot: ordData.pickupSlot,
+                itemsSnapshot: ordData.itemsSnapshot,
+              };
+            }
+          } else {
+            throw new functions.https.HttpsError(
+              'already-exists',
+              'Idempotency key reuse with differing request parameters.',
+            );
           }
-        } else {
-          throw new functions.https.HttpsError(
-            'already-exists',
-            'Idempotency key reuse with differing request parameters.',
-          );
-        }
-      }
-
-      // --- READ 2: Canteen ---
-      const canteenSnap = await transaction.get(canteenRef);
-      if (!canteenSnap.exists) {
-        throw new functions.https.HttpsError('not-found', `Canteen ${canteenId} not found.`);
-      }
-      const canteenData = canteenSnap.data()!;
-      if (canteenData.isActive !== true) {
-        throw new functions.https.HttpsError('failed-precondition', `Canteen ${canteenId} is not active.`);
-      }
-
-      // --- READ 3: Pickup Slot ---
-      const slotSnap = await transaction.get(slotRef);
-      if (!slotSnap.exists) {
-        throw new functions.https.HttpsError('not-found', `Pickup slot ${pickupSlotId} not found.`);
-      }
-      const slotData = slotSnap.data()!;
-      if (slotData.isOpen !== true) {
-        throw new functions.https.HttpsError('failed-precondition', `Pickup slot ${pickupSlotId} is closed.`);
-      }
-
-      // Validate slot schema
-      if (
-        typeof slotData.date !== 'string' ||
-        typeof slotData.startTime !== 'string' ||
-        typeof slotData.endTime !== 'string' ||
-        slotData.timezone !== 'Asia/Kolkata' ||
-        typeof slotData.capacity !== 'number' ||
-        typeof slotData.reservedCount !== 'number'
-      ) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          `Pickup slot ${pickupSlotId} has invalid configuration.`,
-        );
-      }
-
-      // Time validation in Asia/Kolkata
-      const kolkataTime = getKolkataTime();
-      const slotStartMinutes = parseTimeToMinutes(slotData.startTime);
-      const slotEndMinutes = parseTimeToMinutes(slotData.endTime);
-
-      // College operating hours: 08:00 to 19:00 IST
-      if (slotStartMinutes < 8 * 60 || slotEndMinutes > 19 * 60 || slotStartMinutes >= slotEndMinutes) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          `Pickup slot ${pickupSlotId} is outside operating hours (08:00 - 19:00 IST).`,
-        );
-      }
-
-      // Past slot rejection
-      if (slotData.date < kolkataTime.dateStr) {
-        throw new functions.https.HttpsError('failed-precondition', 'Cannot book a pickup slot in the past.');
-      }
-      if (slotData.date === kolkataTime.dateStr && slotStartMinutes <= kolkataTime.totalMinutes) {
-        throw new functions.https.HttpsError('failed-precondition', 'Pickup slot has already passed for today.');
-      }
-
-      // Capacity verification
-      if (slotData.reservedCount >= slotData.capacity) {
-        throw new functions.https.HttpsError(
-          'resource-exhausted',
-          `Pickup slot ${pickupSlotId} is full (Capacity: ${slotData.capacity}).`,
-        );
-      }
-
-      // --- READ 4: Cart Items for Cart-Backed Checkout Verification & Clearing ---
-      const cartRefs = sanitizedItems.map((i) =>
-        db.collection('users').doc(studentUid).collection('cart').doc(i.itemId),
-      );
-      const cartSnaps = await Promise.all(cartRefs.map((ref) => transaction.get(ref)));
-
-      for (let idx = 0; idx < sanitizedItems.length; idx++) {
-        const inputItem = sanitizedItems[idx];
-        const cartSnap = cartSnaps[idx];
-
-        if (!cartSnap.exists) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            `Item ${inputItem.itemId} is not present in your cart. Cart-backed checkout requires all items to exist in cart.`,
-          );
-        }
-        const cartData = cartSnap.data()!;
-        if (cartData.canteenId !== canteenId) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            `Cart item ${inputItem.itemId} belongs to canteen ${cartData.canteenId}, not ${canteenId}.`,
-          );
-        }
-        if (cartData.quantity !== inputItem.quantity) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            `Quantity mismatch for item ${inputItem.itemId}: cart has ${cartData.quantity}, requested ${inputItem.quantity}.`,
-          );
-        }
-      }
-
-      // --- READ 5: Catalog Items ---
-      const itemRefs = sanitizedItems.map((i) =>
-        canteenRef.collection('items').doc(i.itemId),
-      );
-      const itemSnaps = await Promise.all(itemRefs.map((ref) => transaction.get(ref)));
-
-      const itemsSnapshot: Array<{
-        itemId: string;
-        itemName: string;
-        categoryId: string;
-        unitPriceInPaise: number;
-        quantity: number;
-        lineTotalInPaise: number;
-      }> = [];
-
-      let subtotalInPaise = 0;
-
-      for (let idx = 0; idx < sanitizedItems.length; idx++) {
-        const inputItem = sanitizedItems[idx];
-        const snap = itemSnaps[idx];
-
-        if (!snap.exists) {
-          throw new functions.https.HttpsError(
-            'not-found',
-            `Item ${inputItem.itemId} not found in canteen ${canteenId}.`,
-          );
-        }
-        const itemData = snap.data()!;
-        if (itemData.isActive !== true) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            `Item ${itemData.name || inputItem.itemId} is no longer active.`,
-          );
-        }
-        if (itemData.isAvailable !== true) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            `Item ${itemData.name || inputItem.itemId} is currently out of stock.`,
-          );
         }
 
-        const unitPriceInPaise = itemData.priceInPaise;
+        // --- READ 2: Canteen ---
+        const canteenSnap = await transaction.get(canteenRef);
+        if (!canteenSnap.exists) {
+          throw new functions.https.HttpsError('not-found', `Canteen ${canteenId} not found.`);
+        }
+        const canteenData = canteenSnap.data()!;
+        if (canteenData.isActive !== true) {
+          throw new functions.https.HttpsError('failed-precondition', `Canteen ${canteenId} is not active.`);
+        }
+
+        // --- READ 3: Pickup Slot ---
+        const slotSnap = await transaction.get(slotRef);
+        if (!slotSnap.exists) {
+          throw new functions.https.HttpsError('not-found', `Pickup slot ${pickupSlotId} not found.`);
+        }
+        const slotData = slotSnap.data()!;
+        if (slotData.isOpen !== true) {
+          throw new functions.https.HttpsError('failed-precondition', `Pickup slot ${pickupSlotId} is closed.`);
+        }
+
+        // Validate slot schema
         if (
-          typeof unitPriceInPaise !== 'number' ||
-          !Number.isInteger(unitPriceInPaise) ||
-          unitPriceInPaise < 0
+          typeof slotData.date !== 'string' ||
+          typeof slotData.startTime !== 'string' ||
+          typeof slotData.endTime !== 'string' ||
+          slotData.timezone !== 'Asia/Kolkata' ||
+          typeof slotData.capacity !== 'number' ||
+          typeof slotData.reservedCount !== 'number'
         ) {
           throw new functions.https.HttpsError(
-            'internal',
-            `Corrupt price for item ${inputItem.itemId}.`,
+            'failed-precondition',
+            `Pickup slot ${pickupSlotId} has invalid configuration.`,
           );
         }
 
-        const lineTotalInPaise = unitPriceInPaise * inputItem.quantity;
-        subtotalInPaise += lineTotalInPaise;
+        // Time validation in Asia/Kolkata
+        const kolkataTime = getKolkataTime();
+        const slotStartMinutes = parseTimeToMinutes(slotData.startTime);
+        const slotEndMinutes = parseTimeToMinutes(slotData.endTime);
 
-        itemsSnapshot.push({
-          itemId: inputItem.itemId,
-          itemName: itemData.name || inputItem.itemId,
-          categoryId: itemData.categoryId || '',
-          unitPriceInPaise,
-          quantity: inputItem.quantity,
-          lineTotalInPaise,
+        // College operating hours: 08:00 to 19:00 IST
+        if (slotStartMinutes < 8 * 60 || slotEndMinutes > 19 * 60 || slotStartMinutes >= slotEndMinutes) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            `Pickup slot ${pickupSlotId} is outside operating hours (08:00 - 19:00 IST).`,
+          );
+        }
+
+        // Past slot rejection
+        if (slotData.date < kolkataTime.dateStr) {
+          throw new functions.https.HttpsError('failed-precondition', 'Cannot book a pickup slot in the past.');
+        }
+        if (slotData.date === kolkataTime.dateStr && slotStartMinutes <= kolkataTime.totalMinutes) {
+          throw new functions.https.HttpsError('failed-precondition', 'Pickup slot has already passed for today.');
+        }
+
+        // Capacity verification (Partitioned Shards or Legacy Parent Slot)
+        const slotReservationPlan = await planSlotReservationTx(
+          transaction,
+          canteenId,
+          pickupSlotId,
+          slotData,
+          slotRef,
+        );
+        if (slotReservationPlan.isSharded) {
+          chosenReservationMode = 'sharded';
+          chosenShardId = slotReservationPlan.shardId;
+        } else {
+          chosenReservationMode = 'legacy';
+        }
+
+        // --- READ 4: Cart Items for Cart-Backed Checkout Verification & Clearing ---
+        const cartRefs = sanitizedItems.map((i) =>
+          db.collection('users').doc(studentUid).collection('cart').doc(i.itemId),
+        );
+        const cartSnaps = await Promise.all(cartRefs.map((ref) => transaction.get(ref)));
+
+        for (let idx = 0; idx < sanitizedItems.length; idx++) {
+          const inputItem = sanitizedItems[idx];
+          const cartSnap = cartSnaps[idx];
+
+          if (!cartSnap.exists) {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Item ${inputItem.itemId} is not present in your cart. Cart-backed checkout requires all items to exist in cart.`,
+            );
+          }
+          const cartData = cartSnap.data()!;
+          if (cartData.canteenId !== canteenId) {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Cart item ${inputItem.itemId} belongs to canteen ${cartData.canteenId}, not ${canteenId}.`,
+            );
+          }
+          if (cartData.quantity !== inputItem.quantity) {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Quantity mismatch for item ${inputItem.itemId}: cart has ${cartData.quantity}, requested ${inputItem.quantity}.`,
+            );
+          }
+        }
+
+        // --- READ 5: Catalog Items ---
+        const itemRefs = sanitizedItems.map((i) =>
+          canteenRef.collection('items').doc(i.itemId),
+        );
+        const itemSnaps = await Promise.all(itemRefs.map((ref) => transaction.get(ref)));
+
+        const itemsSnapshot: Array<{
+          itemId: string;
+          itemName: string;
+          categoryId: string;
+          unitPriceInPaise: number;
+          quantity: number;
+          lineTotalInPaise: number;
+        }> = [];
+
+        let subtotalInPaise = 0;
+
+        for (let idx = 0; idx < sanitizedItems.length; idx++) {
+          const inputItem = sanitizedItems[idx];
+          const snap = itemSnaps[idx];
+
+          if (!snap.exists) {
+            throw new functions.https.HttpsError(
+              'not-found',
+              `Item ${inputItem.itemId} not found in canteen ${canteenId}.`,
+            );
+          }
+          const itemData = snap.data()!;
+          if (itemData.isActive !== true) {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Item ${itemData.name || inputItem.itemId} is no longer active.`,
+            );
+          }
+          if (itemData.isAvailable !== true) {
+            throw new functions.https.HttpsError(
+              'failed-precondition',
+              `Item ${itemData.name || inputItem.itemId} is currently out of stock.`,
+            );
+          }
+
+          const unitPriceInPaise = itemData.priceInPaise;
+          if (
+            typeof unitPriceInPaise !== 'number' ||
+            !Number.isInteger(unitPriceInPaise) ||
+            unitPriceInPaise < 0
+          ) {
+            throw new functions.https.HttpsError(
+              'internal',
+              `Corrupt price for item ${inputItem.itemId}.`,
+            );
+          }
+
+          const lineTotalInPaise = unitPriceInPaise * inputItem.quantity;
+          subtotalInPaise += lineTotalInPaise;
+
+          itemsSnapshot.push({
+            itemId: inputItem.itemId,
+            itemName: itemData.name || inputItem.itemId,
+            categoryId: itemData.categoryId || '',
+            unitPriceInPaise,
+            quantity: inputItem.quantity,
+            lineTotalInPaise,
+          });
+        }
+
+        const totalInPaise = subtotalInPaise;
+
+        // ======================================================================
+        // ALL READS ARE COMPLETE. NOW PERFORM ALL WRITES.
+        // ======================================================================
+
+        const pickupSlotSnapshot: {
+          slotId: string;
+          pickupDate: string;
+          pickupStartTime: string;
+          pickupEndTime: string;
+          timezone: string;
+          shardId?: string;
+        } = {
+          slotId: pickupSlotId,
+          pickupDate: slotData.date,
+          pickupStartTime: slotData.startTime,
+          pickupEndTime: slotData.endTime,
+          timezone: 'Asia/Kolkata',
+        };
+        if (slotReservationPlan.isSharded && slotReservationPlan.shardId) {
+          pickupSlotSnapshot.shardId = slotReservationPlan.shardId;
+        }
+
+        // Write 1: Order Document
+        const newOrderData = {
+          orderId,
+          studentUid,
+          canteenId,
+          pickupSlotId,
+          pickupSlot: pickupSlotSnapshot,
+          itemsSnapshot,
+          subtotalInPaise,
+          totalInPaise,
+          currency: 'INR',
+          status: 'placed',
+          paymentStatus: 'pending',
+          paymentMethod,
+          idempotencyKey,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        };
+        transaction.set(orderRef, newOrderData);
+
+        // Write 2: Idempotency Record
+        transaction.set(idempotencyRef, {
+          studentUid,
+          orderId,
+          requestHash,
+          totalInPaise,
+          status: 'placed',
+          createdAt: serverTimestamp(),
         });
-      }
 
-      const totalInPaise = subtotalInPaise;
+        // Write 3: Reserve Slot Capacity (Exact Shard or Legacy Slot)
+        executeSlotReservationTx(transaction, slotReservationPlan);
 
-      // ======================================================================
-      // ALL READS ARE COMPLETE. NOW PERFORM ALL WRITES.
-      // ======================================================================
+        // Write 4: Delete submitted items from user's cart
+        for (let idx = 0; idx < cartSnaps.length; idx++) {
+          transaction.delete(cartRefs[idx]);
+        }
 
-      const pickupSlotSnapshot = {
-        slotId: pickupSlotId,
-        pickupDate: slotData.date,
-        pickupStartTime: slotData.startTime,
-        pickupEndTime: slotData.endTime,
-        timezone: 'Asia/Kolkata',
-      };
+        // Write 5: Initial Status History Record
+        const initialHistoryRef = orderRef
+          .collection('statusHistory')
+          .doc(`${orderId}_initial_placed`);
+        transaction.set(initialHistoryRef, {
+          eventId: `${orderId}_initial_placed`,
+          orderId,
+          fromStatus: 'none',
+          toStatus: 'placed',
+          actorUid: studentUid,
+          actorRole: 'student',
+          canteenId,
+          reason: 'Order placed by student',
+          createdAt: serverTimestamp(),
+        });
 
-      // Write 1: Order Document
-      const newOrderData = {
-        orderId,
-        studentUid,
-        canteenId,
-        pickupSlotId,
-        pickupSlot: pickupSlotSnapshot,
-        itemsSnapshot,
-        subtotalInPaise,
-        totalInPaise,
-        currency: 'INR',
-        status: 'placed',
-        paymentStatus: 'pending',
-        paymentMethod,
-        idempotencyKey,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      };
-      transaction.set(orderRef, newOrderData);
+        // Phase 3: Transactional Outbox Events (durable, idempotent notification workflow)
+        writeNotificationOutboxTx(transaction, db, {
+          outboxId: `outbox_${orderId}_placed_student`,
+          sourceEventId: `${orderId}_placed`,
+          sourceEventType: 'order',
+          recipientUid: studentUid,
+          recipientRole: 'student',
+          notificationType: 'order_placed',
+          orderId,
+          canteenId,
+          correlationId: orderId,
+        });
 
-      // Write 2: Idempotency Record
-      transaction.set(idempotencyRef, {
-        studentUid,
-        orderId,
-        requestHash,
-        totalInPaise,
-        status: 'placed',
-        createdAt: serverTimestamp(),
+        writeNotificationOutboxTx(transaction, db, {
+          outboxId: `outbox_${orderId}_placed_admin`,
+          sourceEventId: `${orderId}_placed`,
+          sourceEventType: 'order',
+          recipientRole: 'admin',
+          notificationType: 'new_order_for_admin',
+          orderId,
+          canteenId,
+          correlationId: orderId,
+        });
+
+        return {
+          isRetry: false,
+          orderId,
+          status: 'placed',
+          paymentStatus: 'pending',
+          totalInPaise,
+          subtotalInPaise,
+          pickupSlot: pickupSlotSnapshot,
+          itemsSnapshot,
+        };
       });
 
-      // Write 3: Reserve Slot Capacity
-      transaction.update(slotRef, {
-        reservedCount: slotData.reservedCount + 1,
-        updatedAt: serverTimestamp(),
-      });
-
-      // Write 4: Delete submitted items from user's cart
-      for (let idx = 0; idx < cartSnaps.length; idx++) {
-        transaction.delete(cartRefs[idx]);
-      }
-
-      // Write 5: Initial Status History Record
-      const initialHistoryRef = orderRef
-        .collection('statusHistory')
-        .doc(`${orderId}_initial_placed`);
-      transaction.set(initialHistoryRef, {
-        eventId: `${orderId}_initial_placed`,
+      const totalDurationMs = Date.now() - requestStartTime;
+      const transactionDurationMs = Date.now() - txStartTime;
+      logOrderTelemetry({
+        correlationId: orderId,
+        operation: 'createOrder',
         orderId,
-        fromStatus: 'none',
-        toStatus: 'placed',
-        actorUid: studentUid,
-        actorRole: 'student',
         canteenId,
-        reason: 'Order placed by student',
-        createdAt: serverTimestamp(),
+        isRetry: result.isRetry,
+        reservationMode: chosenReservationMode,
+        shardId: chosenShardId,
+        itemCount: sanitizedItems.length,
+        totalDurationMs,
+        transactionDurationMs,
+        transactionAttempts,
+        status: 'success',
       });
 
       return {
-        isRetry: false,
+        success: true,
+        ...result,
+      };
+    } catch (err: any) {
+      const totalDurationMs = Date.now() - requestStartTime;
+      const errCode = (err as any)?.code || (err as any)?.status || 'unknown';
+      const errMsg = String((err as any)?.message || '');
+      const isContentionAbort =
+        errCode === 10 ||
+        errCode === 'aborted' ||
+        errMsg.includes('ABORTED') ||
+        errMsg.includes('lock timeout');
+
+      logOrderTelemetry({
+        correlationId: orderId,
+        operation: 'createOrder',
         orderId,
-        status: 'placed',
-        paymentStatus: 'pending',
-        totalInPaise,
-        subtotalInPaise,
-        pickupSlot: pickupSlotSnapshot,
-        itemsSnapshot,
-      };
-    });
-
-    // Step 10: Emit in-app notifications after transaction commits (non-blocking, fail-safe).
-    // Notifications do not alter order, payment, refund, or capacity state.
-    if (!result.isRetry) {
-      const { orderId: newOrderId, studentUid: newStudentUid, canteenId: newCanteenId } = {
-        orderId: result.orderId,
-        studentUid,
         canteenId,
-      };
-      const sourceEventId = `${newOrderId}_placed`;
-      createNotificationInternal({
-        sourceEventId,
-        sourceEventType: 'order',
-        recipientUid: newStudentUid,
-        type: 'order_placed',
-        orderId: newOrderId,
-        canteenId: newCanteenId,
-      }).catch((err) =>
-        functions.logger.warn('[Step10] order_placed student notification failed (non-fatal):', err?.message),
-      );
-      notifyAssignedCanteenAdmins({
-        canteenId: newCanteenId,
-        type: 'new_order_for_admin',
-        orderId: newOrderId,
-        sourceEventId,
-        sourceEventType: 'order',
-      }).catch((err) =>
-        functions.logger.warn('[Step10] new_order_for_admin notification failed (non-fatal):', err?.message),
-      );
-    }
+        itemCount: sanitizedItems.length,
+        totalDurationMs,
+        transactionDurationMs: txStartTime ? Date.now() - txStartTime : 0,
+        transactionAttempts,
+        abortCategory: isContentionAbort ? 'contention_abort' : 'none',
+        errorCategory: String(errCode),
+        status: isContentionAbort ? 'aborted' : 'error',
+      });
 
-    return {
-      success: true,
-      ...result,
-    };
+      throw err;
+    }
   },
 );
 
@@ -1743,8 +2162,14 @@ export const transitionOrderStatus = functions.https.onCall(
         let allowedNext: OrderStatus[] = [];
 
         if (currentStatus === 'placed') {
+          if (actorRole === 'service_desk') {
+            throw new functions.https.HttpsError(
+              'permission-denied',
+              'Service desk operators cannot transition unverified placed orders. Payment approval required.',
+            );
+          }
           if (paymentMethod === 'cash') {
-            // Cash orders skip payment_verified and can be directly accepted by admin
+            // Canteen admin explicitly approves cash payment upon accepting the order
             allowedNext = ['accepted', 'cancelled', 'rejected'];
           } else {
             // Online orders must have payment verified before admin can accept
@@ -1782,22 +2207,18 @@ export const transitionOrderStatus = functions.https.onCall(
       // READ 3 & INVARIANT VALIDATION: Pickup Slot for Capacity Release (on cancellation / rejection)
       const isCancellationOrRejection = nextStatus === 'cancelled' || nextStatus === 'rejected';
       const slotId = orderData.pickupSlotId || orderData.pickupSlot?.slotId;
-      let slotRef: FirebaseFirestore.DocumentReference | null = null;
-      let validatedNewReservedCount: number | null = null;
+      const orderShardId = orderData.pickupSlot?.shardId;
+      let slotReleasePlan: SlotReleasePlan | null = null;
 
       if (isCancellationOrRejection && slotId && typeof slotId === 'string' && slotId.trim().length > 0) {
-        slotRef = db
-          .collection('canteens')
-          .doc(orderData.canteenId)
-          .collection('pickupSlots')
-          .doc(slotId);
-        const slotSnap = await transaction.get(slotRef);
-        const releaseResult = validateAndComputeSlotCapacityRelease(
+        slotReleasePlan = await planSlotReleaseTx(
+          transaction,
+          db,
           orderData.canteenId,
           slotId,
-          slotSnap,
+          orderShardId,
+          validateAndComputeSlotCapacityRelease,
         );
-        validatedNewReservedCount = releaseResult.newReservedCount;
       }
 
       // READ 4: Payment doc for demo refund if order was paid (Step 9 Ordering)
@@ -1821,17 +2242,17 @@ export const transitionOrderStatus = functions.https.onCall(
         status: nextStatus,
         updatedAt: serverTimestamp(),
       };
+      if (currentStatus === 'placed' && paymentMethod === 'cash' && nextStatus === 'accepted') {
+        orderUpdates.paymentStatus = 'payment_verified';
+      }
       if (isRefundInitiated) {
         orderUpdates.refundStatus = 'pending';
       }
       transaction.update(orderRef, orderUpdates);
 
-      // Write 2: Decrement slot capacity reservedCount (exactly once, validated newReservedCount >= 0)
-      if (slotRef && validatedNewReservedCount !== null) {
-        transaction.update(slotRef, {
-          reservedCount: validatedNewReservedCount,
-          updatedAt: serverTimestamp(),
-        });
+      // Write 2: Decrement slot capacity reservedCount (exact shard or legacy parent slot)
+      if (slotReleasePlan) {
+        executeSlotReleaseTx(transaction, slotReleasePlan);
       }
 
       // Write 3: Append deterministic immutable status history entry
@@ -1891,6 +2312,48 @@ export const transitionOrderStatus = functions.https.onCall(
         });
       }
 
+      // Phase 3: Transactional Outbox Events (durable, idempotent notification workflow)
+      const STATUS_TO_NOTIFICATION_TYPE: Record<string, import('./notifications/notificationService').StudentNotificationType | null> = {
+        accepted: 'order_accepted',
+        preparing: 'order_preparing',
+        ready_for_pickup: 'order_ready_for_pickup',
+        completed: 'order_completed',
+        cancelled: 'order_cancelled',
+        rejected: 'order_rejected',
+      };
+      const notifType = STATUS_TO_NOTIFICATION_TYPE[nextStatus];
+      if (notifType && orderData.studentUid) {
+        const sourceEventId = currentStatus
+          ? `${orderId}_${currentStatus}_to_${nextStatus}`
+          : `${orderId}_to_${nextStatus}`;
+        writeNotificationOutboxTx(transaction, db, {
+          outboxId: `outbox_${sourceEventId}_student`,
+          sourceEventId,
+          sourceEventType: 'order',
+          recipientUid: orderData.studentUid,
+          recipientRole: 'student',
+          notificationType: notifType,
+          orderId,
+          canteenId: orderData.canteenId,
+          correlationId: orderId,
+        });
+      }
+
+      if (isRefundInitiated && activePaidPaymentSnap && orderData.studentUid) {
+        const refundSourceEventId = `${activePaidPaymentSnap.id}_refund_pending`;
+        writeNotificationOutboxTx(transaction, db, {
+          outboxId: `outbox_${refundSourceEventId}_student`,
+          sourceEventId: refundSourceEventId,
+          sourceEventType: 'refund',
+          recipientUid: orderData.studentUid,
+          recipientRole: 'student',
+          notificationType: 'refund_pending_demo',
+          orderId,
+          canteenId: orderData.canteenId,
+          correlationId: orderId,
+        });
+      }
+
       return {
         success: true,
         isIdempotent: false,
@@ -1899,79 +2362,10 @@ export const transitionOrderStatus = functions.https.onCall(
         status: nextStatus,
         paymentStatus: currentPaymentStatus,
         refundStatus: isRefundInitiated ? 'pending' : (orderData.refundStatus || 'not_requested'),
-        _notifMeta: {
-          studentUid: orderData.studentUid,
-          canteenId: orderData.canteenId,
-          nextStatus,
-          isRefundInitiated,
-          activePaidPaymentId: activePaidPaymentSnap?.id,
-        },
       };
-    }).then(async (result) => {
-      // Step 10: Emit status-change notification (fire-and-forget, never alters order state)
-      if (!result.isIdempotent && result.fromStatus !== result.status) {
-        const { studentUid: sUid, canteenId: cId, nextStatus: ns, isRefundInitiated: isRefInit, activePaidPaymentId: payId } = (result as any)._notifMeta || {};
-        if (sUid && ns) {
-          _dispatchTransitionNotification(orderId, sUid, cId, result.fromStatus, ns);
-          if (isRefInit && payId) {
-            try {
-              await createNotificationInternal({
-                sourceEventId: `${payId}_refund_pending`,
-                sourceEventType: 'refund',
-                recipientUid: sUid,
-                recipientRole: 'student',
-                type: 'refund_pending_demo',
-                orderId,
-                canteenId: cId,
-              });
-            } catch (err: any) {
-              functions.logger.warn('[Step10] auto-refund notification failed (non-fatal):', err?.message);
-            }
-          }
-        }
-      }
-      const { _notifMeta: _m, ...publicResult } = result as any;
-      return publicResult;
     });
   },
 );
-
-// Step 10 — Notification dispatch wrapper for transitionOrderStatus
-// Defined immediately after the export so it can access the result after the function executes.
-// This is a fire-and-forget side effect; it never modifies order/payment/refund state.
-const _dispatchTransitionNotification = (
-  orderId: string,
-  studentUid: string,
-  canteenId: string,
-  fromStatus: string | undefined,
-  nextStatus: string,
-): void => {
-  const STATUS_TO_NOTIFICATION_TYPE: Record<string, import('./notifications/notificationService').StudentNotificationType | null> = {
-    accepted: 'order_accepted',
-    preparing: 'order_preparing',
-    ready_for_pickup: 'order_ready_for_pickup',
-    completed: 'order_completed',
-    cancelled: 'order_cancelled',
-    rejected: 'order_rejected',
-  };
-  const notifType = STATUS_TO_NOTIFICATION_TYPE[nextStatus];
-  if (notifType && studentUid) {
-    const sourceEventId = fromStatus
-      ? `${orderId}_${fromStatus}_to_${nextStatus}`
-      : `${orderId}_to_${nextStatus}`;
-    createNotificationInternal({
-      sourceEventId,
-      sourceEventType: 'order',
-      recipientUid: studentUid,
-      recipientRole: 'student',
-      type: notifType,
-      orderId,
-      canteenId,
-    }).catch((err) =>
-      functions.logger.warn(`[Step10] ${notifType} notification failed (non-fatal):`, err?.message),
-    );
-  }
-};
 
 /**
  * Callable Function: verifyDemoPayment (Step 8 — Emulator-Only Demo Behavior)
@@ -2010,21 +2404,8 @@ export const verifyDemoPayment = functions.https.onCall(
       }
       const orderData = orderSnap.data()!;
 
-      // Ownership check: Student owner or assigned admin
-      if (orderData.studentUid !== callerUid) {
-        const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
-        const isAdmin =
-          adminSnap.exists &&
-          adminSnap.data()?.status === 'active' &&
-          (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
-            adminSnap.data()?.role === 'platform_operator');
-        if (!isAdmin) {
-          throw new functions.https.HttpsError(
-            'permission-denied',
-            'Only the order owner or assigned admin can verify demo payment.',
-          );
-        }
-      }
+      // Ownership check: Student owner or assigned admin (service_desk strictly denied)
+      await verifyFinancialAuthorization(callerUid, orderData, true, transaction);
 
       // Preconditions
       if (orderData.paymentMethod !== 'upi_demo') {
@@ -2073,6 +2454,111 @@ export const verifyDemoPayment = functions.https.onCall(
         orderId,
         status: 'payment_verified',
         paymentStatus: 'succeeded_demo',
+      };
+    });
+  },
+);
+
+/**
+ * Callable Function: approveCashPayment
+ *
+ * Explicitly records payment approval for a cash order.
+ * Restricted to assigned canteen_admin or platform_operator.
+ * Service desk attendants and students are strictly denied.
+ */
+export const approveCashPayment = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required to approve cash payment.',
+      );
+    }
+    const callerUid = context.auth.uid;
+
+    rejectUnknownFields(data, ['orderId'], 'approveCashPayment');
+    const orderId = validateId(data.orderId, 'orderId');
+    const orderRef = db.collection('orders').doc(orderId);
+
+    return await db.runTransaction(async (transaction) => {
+      const orderSnap = await transaction.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new functions.https.HttpsError('not-found', `Order ${orderId} not found.`);
+      }
+      const orderData = orderSnap.data()!;
+
+      // Verify financial authorization: canteen_admin or platform_operator only (allowStudentOwner: false)
+      await verifyFinancialAuthorization(callerUid, orderData, false, transaction);
+
+      // Validate paymentMethod is cash
+      if (orderData.paymentMethod !== 'cash') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Cannot approve cash payment for order with paymentMethod '${orderData.paymentMethod}'.`,
+        );
+      }
+
+      // Idempotency: if already approved
+      if (orderData.status === 'payment_verified' && orderData.paymentStatus === 'payment_verified') {
+        return {
+          success: true,
+          isIdempotent: true,
+          orderId,
+          status: 'payment_verified',
+          paymentStatus: 'payment_verified',
+        };
+      }
+
+      if (orderData.status !== 'placed') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          `Order ${orderId} has status '${orderData.status}'. Cash approval requires status 'placed'.`,
+        );
+      }
+
+      // Atomically update order status and paymentStatus
+      transaction.update(orderRef, {
+        paymentStatus: 'payment_verified',
+        status: 'payment_verified',
+        cashApprovedBy: callerUid,
+        cashApprovedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      // Write statusHistory
+      const eventId = `${orderId}_placed_to_payment_verified_cash`;
+      const historyRef = orderRef.collection('statusHistory').doc(eventId);
+      transaction.set(historyRef, {
+        eventId,
+        orderId,
+        fromStatus: 'placed',
+        toStatus: 'payment_verified',
+        actorUid: callerUid,
+        actorRole: 'canteen_admin',
+        canteenId: orderData.canteenId,
+        reason: 'Cash payment approved by authorized canteen admin',
+        createdAt: serverTimestamp(),
+      });
+
+      // Write auditEvents
+      const auditRef = orderRef.collection('auditEvents').doc(eventId);
+      transaction.set(auditRef, {
+        eventId,
+        orderId,
+        canteenId: orderData.canteenId,
+        eventType: 'cash_payment_approved',
+        fromStatus: 'placed',
+        toStatus: 'payment_verified',
+        actorUid: callerUid,
+        actorRole: 'canteen_admin',
+        createdAt: serverTimestamp(),
+      });
+
+      return {
+        success: true,
+        orderId,
+        status: 'payment_verified',
+        paymentStatus: 'payment_verified',
       };
     });
   },
@@ -2212,7 +2698,19 @@ export const searchAdminOrder = functions.https.onCall(
  */
 export const transitionOperationalOrderStatus = functions.https.onCall(
   async (data: Record<string, any>, context) => {
-    return await (transitionOrderStatus as any).run(data, context);
+    rejectUnknownFields(
+      data,
+      ['orderId', 'nextStatus', 'targetStatus', 'reason', 'idempotencyKey'],
+      'transitionOperationalOrderStatus',
+    );
+    const res = await (transitionOrderStatus as any).run(data, context);
+    return {
+      success: res.success,
+      isIdempotent: res.isIdempotent,
+      orderId: res.orderId,
+      fromStatus: res.fromStatus,
+      status: res.status,
+    };
   },
 );
 
@@ -2305,34 +2803,54 @@ export const listOperationalOrders = functions.https.onCall(
 
     const snapshot = await query.get();
 
-    const orders = snapshot.docs.map((doc) => {
-      const d = doc.data();
-      const rawUid = typeof d.studentUid === 'string' ? d.studentUid : '';
-      const maskedCustomer = rawUid ? `student_...${rawUid.slice(-4)}` : 'anonymous_student';
+    // Compute live incoming eligible order count for targetCanteen (Section 1.4)
+    const incomingSnap = await db
+      .collection('orders')
+      .where('canteenId', '==', targetCanteen)
+      .where('status', 'in', ['placed', 'payment_verified'])
+      .get();
+    const incomingEligibleCount = incomingSnap.docs.filter((doc) =>
+      isOrderIncomingEligible(doc.data()),
+    ).length;
 
-      const itemCount = Array.isArray(d.itemsSnapshot)
-        ? d.itemsSnapshot.reduce(
-            (acc: number, item: any) =>
-              acc + (typeof item.quantity === 'number' ? item.quantity : 1),
-            0,
-          )
-        : 0;
+    // Filter query results by operational eligibility (Section 1.1)
+    const eligibleDocs = snapshot.docs.filter((doc) => isOrderOperationallyEligible(doc.data()));
+
+    const orders = eligibleDocs.map((doc) => {
+      const d = doc.data();
+
+      const items = Array.isArray(d.itemsSnapshot)
+        ? d.itemsSnapshot.map((i: any) => ({
+            itemId: i.itemId || '',
+            itemName: i.name || i.itemName || '',
+            quantity: typeof i.quantity === 'number' ? i.quantity : 1,
+          }))
+        : [];
+
+      const itemCount = items.reduce(
+        (acc: number, item: any) => acc + (typeof item.quantity === 'number' ? item.quantity : 1),
+        0,
+      );
 
       return {
         orderId: d.orderId || doc.id,
         shortOrderReference: (d.orderId || doc.id).slice(0, 8).toUpperCase(),
         canteenId: d.canteenId,
-        orderStatus: d.status,
+        items,
+        pickupSlot: d.pickupSlot
+          ? {
+              pickupDate: d.pickupSlot.pickupDate || '',
+              pickupStartTime: d.pickupSlot.pickupStartTime || d.pickupSlot.startTime || '',
+              pickupEndTime: d.pickupSlot.pickupEndTime || d.pickupSlot.endTime || '',
+              timezone: d.pickupSlot.timezone || 'Asia/Kolkata',
+            }
+          : null,
         status: d.status,
-        paymentStatus: d.paymentStatus || 'pending',
-        refundStatus: d.refundStatus || 'not_requested',
-        pickupSlot: d.pickupSlot || null,
+        orderStatus: d.status,
         itemCount,
-        totalInPaise: typeof d.totalInPaise === 'number' ? d.totalInPaise : 0,
-        maskedCustomer,
         createdAt: d.createdAt || null,
         updatedAt: d.updatedAt || null,
-        activePaymentId: d.activePaymentId ? String(d.activePaymentId).slice(0, 32) : null,
+        operationalReason: d.rejectionReason || d.cancellationReason || undefined,
       };
     });
 
@@ -2340,6 +2858,7 @@ export const listOperationalOrders = functions.https.onCall(
       success: true,
       canteenId: targetCanteen,
       count: orders.length,
+      incomingEligibleCount,
       orders,
     };
   },
@@ -2428,16 +2947,27 @@ export const searchOperationalOrders = functions.https.onCall(
       };
     }
 
-    const rawUid = typeof d.studentUid === 'string' ? d.studentUid : '';
-    const maskedCustomer = rawUid ? `student_...${rawUid.slice(-4)}` : 'anonymous_student';
+    // Enforce operational eligibility predicate (Section 1.1)
+    if (!isOrderOperationallyEligible(d)) {
+      return {
+        success: true,
+        found: false,
+        order: null,
+      };
+    }
 
-    const itemCount = Array.isArray(d.itemsSnapshot)
-      ? d.itemsSnapshot.reduce(
-          (acc: number, item: any) =>
-            acc + (typeof item.quantity === 'number' ? item.quantity : 1),
-          0,
-        )
-      : 0;
+    const items = Array.isArray(d.itemsSnapshot)
+      ? d.itemsSnapshot.map((i: any) => ({
+          itemId: i.itemId || '',
+          itemName: i.name || i.itemName || '',
+          quantity: typeof i.quantity === 'number' ? i.quantity : 1,
+        }))
+      : [];
+
+    const itemCount = items.reduce(
+      (acc: number, item: any) => acc + (typeof item.quantity === 'number' ? item.quantity : 1),
+      0,
+    );
 
     return {
       success: true,
@@ -2446,17 +2976,21 @@ export const searchOperationalOrders = functions.https.onCall(
         orderId: d.orderId || docSnap.id,
         shortOrderReference: (d.orderId || docSnap.id).slice(0, 8).toUpperCase(),
         canteenId: d.canteenId,
-        orderStatus: d.status,
+        items,
+        pickupSlot: d.pickupSlot
+          ? {
+              pickupDate: d.pickupSlot.pickupDate || '',
+              pickupStartTime: d.pickupSlot.pickupStartTime || d.pickupSlot.startTime || '',
+              pickupEndTime: d.pickupSlot.pickupEndTime || d.pickupSlot.endTime || '',
+              timezone: d.pickupSlot.timezone || 'Asia/Kolkata',
+            }
+          : null,
         status: d.status,
-        paymentStatus: d.paymentStatus || 'pending',
-        refundStatus: d.refundStatus || 'not_requested',
-        pickupSlot: d.pickupSlot || null,
-        itemsSnapshot: d.itemsSnapshot || [],
+        orderStatus: d.status,
         itemCount,
-        totalInPaise: typeof d.totalInPaise === 'number' ? d.totalInPaise : 0,
-        maskedCustomer,
         createdAt: d.createdAt || null,
         updatedAt: d.updatedAt || null,
+        operationalReason: d.rejectionReason || d.cancellationReason || undefined,
       },
     };
   },
@@ -2486,8 +3020,23 @@ export const getOperationalOrderDetails = functions.https.onCall(
       throw new functions.https.HttpsError('not-found', 'Order not found.');
     }
 
-    const rawUid = typeof d.studentUid === 'string' ? d.studentUid : '';
-    const maskedCustomer = rawUid ? `student_...${rawUid.slice(-4)}` : 'anonymous_student';
+    // Enforce operational eligibility predicate (Section 1.1)
+    if (!isOrderOperationallyEligible(d)) {
+      throw new functions.https.HttpsError('not-found', 'Order not found.');
+    }
+
+    const items = Array.isArray(d.itemsSnapshot)
+      ? d.itemsSnapshot.map((i: any) => ({
+          itemId: i.itemId || '',
+          itemName: i.name || i.itemName || '',
+          quantity: typeof i.quantity === 'number' ? i.quantity : 1,
+        }))
+      : [];
+
+    const itemCount = items.reduce(
+      (acc: number, item: any) => acc + (typeof item.quantity === 'number' ? item.quantity : 1),
+      0,
+    );
 
     // Fetch operational notes
     const notesSnap = await docSnap.ref.collection('operationalNotes').get();
@@ -2565,23 +3114,58 @@ export const getOperationalOrderDetails = functions.https.onCall(
         orderId: d.orderId || docSnap.id,
         shortOrderReference: (d.orderId || docSnap.id).slice(0, 8).toUpperCase(),
         canteenId: d.canteenId,
-        orderStatus: d.status,
+        items,
+        pickupSlot: d.pickupSlot
+          ? {
+              pickupDate: d.pickupSlot.pickupDate || '',
+              pickupStartTime: d.pickupSlot.pickupStartTime || d.pickupSlot.startTime || '',
+              pickupEndTime: d.pickupSlot.pickupEndTime || d.pickupSlot.endTime || '',
+              timezone: d.pickupSlot.timezone || 'Asia/Kolkata',
+            }
+          : null,
         status: d.status,
-        paymentStatus: d.paymentStatus || 'pending',
-        paymentMethod: d.paymentMethod,
-        refundStatus: d.refundStatus || 'not_requested',
-        pickupSlot: d.pickupSlot || null,
-        itemsSnapshot: d.itemsSnapshot || [],
-        totalInPaise: typeof d.totalInPaise === 'number' ? d.totalInPaise : 0,
-        maskedCustomer,
+        orderStatus: d.status,
+        itemCount,
         createdAt: d.createdAt || null,
         updatedAt: d.updatedAt || null,
+        operationalReason: d.rejectionReason || d.cancellationReason || undefined,
         operationalNotes,
         auditHistory,
       },
     };
   },
 );
+
+/**
+ * Callable Function: getIncomingOrderCount (Section 1.4 Live Counter)
+ *
+ * Computes live count of incoming eligible orders for assigned canteen.
+ */
+export const getIncomingOrderCount = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    rejectUnknownFields(data, ['canteenId'], 'getIncomingOrderCount');
+    const targetCanteen = data.canteenId ? validateId(data.canteenId, 'canteenId') : undefined;
+    const { canteenIds } = await verifyOperationalAccess(context, targetCanteen);
+    const canteen = targetCanteen || canteenIds[0] || ALLOWED_CANTEEN_IDS[0];
+
+    const placedSnap = await db
+      .collection('orders')
+      .where('canteenId', '==', canteen)
+      .where('status', 'in', ['placed', 'payment_verified'])
+      .get();
+
+    const incomingCount = placedSnap.docs.filter((doc) =>
+      isOrderIncomingEligible(doc.data()),
+    ).length;
+
+    return {
+      success: true,
+      canteenId: canteen,
+      incomingCount,
+    };
+  },
+);
+
 
 /**
  * Callable Function: createOperationalNote (Step 11)
@@ -3158,23 +3742,14 @@ export const completeDemoPayment = functions.https.onCall(
       }
       const orderData = orderSnap.data()!;
 
-      // Ownership: Student owner or assigned admin
-      const isStudentOwner = orderData.studentUid === callerUid;
-      let isAdmin = false;
-      if (!isStudentOwner) {
-        const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
-        isAdmin =
-          adminSnap.exists &&
-          adminSnap.data()?.status === 'active' &&
-          (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
-            adminSnap.data()?.role === 'platform_operator');
-        if (!isAdmin) {
-          throw new functions.https.HttpsError(
-            'permission-denied',
-            'Caller is not authorized to complete payment for this order.',
-          );
-        }
-      }
+      // Ownership: Student owner or assigned admin (strictly excluding service_desk)
+      const { isAdmin } = await verifyFinancialAuthorization(
+        callerUid,
+        orderData,
+        true,
+        transaction,
+      );
+
 
       // READ 2: Payment Document
       const paymentSnap = await transaction.get(paymentRef);
@@ -3309,6 +3884,30 @@ export const completeDemoPayment = functions.https.onCall(
         createdAt: serverTimestamp(),
       });
 
+      // Phase 3: Transactional Outbox Events (durable, idempotent notification workflow)
+      writeNotificationOutboxTx(transaction, db, {
+        outboxId: `outbox_${paymentId}_succeeded_demo_student`,
+        sourceEventId: `${paymentId}_succeeded_demo`,
+        sourceEventType: 'payment',
+        recipientUid: orderData.studentUid,
+        recipientRole: 'student',
+        notificationType: 'payment_succeeded_demo',
+        orderId,
+        canteenId: orderData.canteenId,
+        correlationId: paymentId,
+      });
+
+      writeNotificationOutboxTx(transaction, db, {
+        outboxId: `outbox_${paymentId}_succeeded_demo_admin`,
+        sourceEventId: `${paymentId}_succeeded_demo`,
+        sourceEventType: 'payment',
+        recipientRole: 'admin',
+        notificationType: 'payment_verified_for_admin',
+        orderId,
+        canteenId: orderData.canteenId,
+        correlationId: paymentId,
+      });
+
       return {
         success: true,
         isRetry: false,
@@ -3316,39 +3915,7 @@ export const completeDemoPayment = functions.https.onCall(
         paymentId,
         status: 'succeeded_demo',
         orderStatus: 'payment_verified',
-        _notifMeta: {
-          studentUid: orderData.studentUid,
-          canteenId: orderData.canteenId,
-        },
       };
-    }).then((result) => {
-      // Step 10: Emit in-app notifications after transaction commits
-      if (!result.isRetry) {
-        const { studentUid: sUid, canteenId: cId } = (result as any)._notifMeta || {};
-        if (sUid) {
-          createNotificationInternal({
-            sourceEventId: `${paymentId}_succeeded_demo`,
-            sourceEventType: 'payment',
-            recipientUid: sUid,
-            type: 'payment_succeeded_demo',
-            orderId,
-            canteenId: cId,
-          }).catch((err) =>
-            functions.logger.warn('[Step10] payment_succeeded_demo notification failed (non-fatal):', err?.message),
-          );
-          notifyAssignedCanteenAdmins({
-            canteenId: cId,
-            type: 'payment_verified_for_admin',
-            orderId,
-            sourceEventId: `${paymentId}_succeeded_demo`,
-            sourceEventType: 'payment',
-          }).catch((err) =>
-            functions.logger.warn('[Step10] payment_verified_for_admin notification failed (non-fatal):', err?.message),
-          );
-        }
-      }
-      const { _notifMeta: _m, ...publicResult } = result as any;
-      return publicResult;
     });
   },
 );
@@ -3390,23 +3957,14 @@ export const failDemoPayment = functions.https.onCall(
       }
       const orderData = orderSnap.data()!;
 
-      // Ownership: Student owner or assigned admin
-      const isStudentOwner = orderData.studentUid === callerUid;
-      let isAdmin = false;
-      if (!isStudentOwner) {
-        const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
-        isAdmin =
-          adminSnap.exists &&
-          adminSnap.data()?.status === 'active' &&
-          (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
-            adminSnap.data()?.role === 'platform_operator');
-        if (!isAdmin) {
-          throw new functions.https.HttpsError(
-            'permission-denied',
-            'Caller is not authorized to fail payment for this order.',
-          );
-        }
-      }
+      // Ownership: Student owner or assigned admin (strictly excluding service_desk)
+      const { isAdmin } = await verifyFinancialAuthorization(
+        callerUid,
+        orderData,
+        true,
+        transaction,
+      );
+
 
       // READ 2: Payment Document
       const paymentSnap = await transaction.get(paymentRef);
@@ -3656,23 +4214,14 @@ export const expirePaymentAttempt = functions.https.onCall(
       }
       const paymentData = paymentSnap.data()!;
 
-      // Ownership: Student owner or assigned admin
-      const isStudentOwner = orderData.studentUid === callerUid;
-      let isAdmin = false;
-      if (!isStudentOwner) {
-        const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
-        isAdmin =
-          adminSnap.exists &&
-          adminSnap.data()?.status === 'active' &&
-          (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
-            adminSnap.data()?.role === 'platform_operator');
-        if (!isAdmin) {
-          throw new functions.https.HttpsError(
-            'permission-denied',
-            'Caller is not authorized to expire payment for this order.',
-          );
-        }
-      }
+      // Ownership: Student owner or assigned admin (strictly excluding service_desk)
+      const { isStudentOwner, isAdmin } = await verifyFinancialAuthorization(
+        callerUid,
+        orderData,
+        true,
+        transaction,
+      );
+
 
       // Verify payment belongs to this order
       if (paymentData.orderId !== orderId) {
@@ -3783,19 +4332,13 @@ export const getPaymentStatus = functions.https.onCall(
     }
     const orderData = orderSnap.data()!;
 
-    const isStudentOwner = orderData.studentUid === callerUid;
-    let isAdmin = false;
-    if (!isStudentOwner) {
-      const adminSnap = await db.collection('admins').doc(callerUid).get();
-      isAdmin =
-        adminSnap.exists &&
-        adminSnap.data()?.status === 'active' &&
-        (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
-          adminSnap.data()?.role === 'platform_operator');
-      if (!isAdmin) {
-        throw new functions.https.HttpsError('permission-denied', 'Not authorized to view payment.');
-      }
-    }
+    // Ownership: Student owner or assigned admin (strictly excluding service_desk)
+    const { isStudentOwner, isAdmin } = await verifyFinancialAuthorization(
+      callerUid,
+      orderData,
+      true,
+    );
+
 
     const paymentSnap = await db
       .collection('orders')
@@ -3892,20 +4435,14 @@ export const requestDemoRefund = functions.https.onCall(
       }
       const orderData = orderSnap.data()!;
 
-      // Ownership: Student owner or assigned admin
-      const isStudentOwner = orderData.studentUid === callerUid;
-      let isAdmin = false;
-      if (!isStudentOwner) {
-        const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
-        isAdmin =
-          adminSnap.exists &&
-          adminSnap.data()?.status === 'active' &&
-          (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
-            adminSnap.data()?.role === 'platform_operator');
-        if (!isAdmin) {
-          throw new functions.https.HttpsError('permission-denied', 'Not authorized.');
-        }
-      }
+      // Ownership: Student owner or assigned admin (strictly excluding service_desk)
+      const { isAdmin } = await verifyFinancialAuthorization(
+        callerUid,
+        orderData,
+        true,
+        transaction,
+      );
+
 
       // Precondition: Order must be in terminal state 'cancelled' or 'rejected'
       if (orderData.status !== 'cancelled' && orderData.status !== 'rejected') {
@@ -4060,19 +4597,9 @@ export const completeDemoRefund = functions.https.onCall(
       }
       const orderData = orderSnap.data()!;
 
-      // Authorization: Admin only
-      const adminSnap = await transaction.get(db.collection('admins').doc(callerUid));
-      const isAdmin =
-        adminSnap.exists &&
-        adminSnap.data()?.status === 'active' &&
-        (adminSnap.data()?.canteenIds?.includes(orderData.canteenId) ||
-          adminSnap.data()?.role === 'platform_operator');
-      if (!isAdmin) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Only authorized canteen administrators can finalize refunds.',
-        );
-      }
+      // Authorization: Admin only (strictly excluding service_desk, canteen_admin or platform_operator required)
+      await verifyFinancialAuthorization(callerUid, orderData, false, transaction);
+
 
       // READ 2: Payment
       const paymentSnap = await transaction.get(paymentRef);

@@ -237,20 +237,106 @@ export async function getAvailablePickupSlots(canteenId: string): Promise<Pickup
 }
 
 /**
+ * Determines whether an error from createOrderCallable is retryable.
+ * Only retryable transport failures (network drops, timeouts) and transient server contention errors (aborted / lock timeout).
+ * Business validation failures, permission errors, capacity exhaustion, and invalid arguments are never retried.
+ */
+function isRetryableOrderError(err: any): boolean {
+  if (!err) return false;
+
+  const code = (err.code || '').toString().toLowerCase();
+  const message = (err.message || '').toString().toLowerCase();
+  const status = (err.status || '').toString().toUpperCase();
+
+  // Explicit non-retryable categories
+  if (
+    code.includes('invalid-argument') ||
+    code.includes('failed-precondition') ||
+    code.includes('permission-denied') ||
+    code.includes('unauthenticated') ||
+    code.includes('not-found') ||
+    code.includes('already-exists') ||
+    code.includes('resource-exhausted') ||
+    code.includes('out-of-range') ||
+    status === 'INVALID_ARGUMENT' ||
+    status === 'FAILED_PRECONDITION' ||
+    status === 'PERMISSION_DENIED' ||
+    status === 'UNAUTHENTICATED' ||
+    status === 'NOT_FOUND' ||
+    status === 'ALREADY_EXISTS' ||
+    status === 'RESOURCE_EXHAUSTED'
+  ) {
+    return false;
+  }
+
+  // Retryable transport and contention error codes
+  if (
+    code.includes('unavailable') ||
+    code.includes('deadline-exceeded') ||
+    code.includes('aborted') ||
+    status === 'UNAVAILABLE' ||
+    status === 'DEADLINE_EXCEEDED' ||
+    status === 'ABORTED' ||
+    message.includes('aborted') ||
+    message.includes('lock timeout') ||
+    message.includes('network') ||
+    message.includes('timeout') ||
+    message.includes('econnreset')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Calculates exponential backoff with jitter.
+ * base delay: 1000ms, factor: 2, max backoff: 8000ms, jitter: 0-500ms.
+ */
+function calculateRetryBackoff(attempt: number): number {
+  const baseDelay = 1000;
+  const factor = 2;
+  const maxBackoff = 8000;
+  const jitter = Math.floor(Math.random() * 500);
+
+  const exponentialDelay = baseDelay * Math.pow(factor, attempt - 1);
+  return Math.min(exponentialDelay, maxBackoff) + jitter;
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
  * Calls the trusted 'createOrder' Cloud Function to perform server-side order calculation,
  * pickup slot capacity reservation, idempotency recording, and cart clearing.
+ * Applies bounded retry with exponential backoff and jitter for transient transport/contention errors.
  */
 export async function createOrderCallable(
   input: CreateOrderInput,
 ): Promise<CreateOrderResult> {
-  try {
-    const callable = functions().httpsCallable('createOrder');
-    const response = await callable(input);
-    return response.data as CreateOrderResult;
-  } catch (err: any) {
-    console.error('[orderService] createOrderCallable error:', err);
-    throw err;
+  const maxAttempts = 3;
+  let lastError: any = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const callable = functions().httpsCallable('createOrder');
+      const response = await callable(input);
+      return response.data as CreateOrderResult;
+    } catch (err: any) {
+      lastError = err;
+      console.error(`[orderService] createOrderCallable attempt ${attempt}/${maxAttempts} failed:`, err);
+
+      if (attempt >= maxAttempts || !isRetryableOrderError(err)) {
+        throw err;
+      }
+
+      const backoffMs = calculateRetryBackoff(attempt);
+      await delayMs(backoffMs);
+    }
   }
+
+  throw lastError;
 }
 
 /**

@@ -10,6 +10,9 @@ import { home } from "../styles/Studentstyles";
 import { useNavigation } from "@react-navigation/native";
 import firestore from "@react-native-firebase/firestore";
 
+import auth from "@react-native-firebase/auth";
+import { setUserCartItem, removeUserCartItem } from "../services/orderService";
+
 export default function MMLibraryScreen() {
   const navigation = useNavigation<any>();
 
@@ -19,88 +22,91 @@ export default function MMLibraryScreen() {
   const [quantities, setQuantities] = useState<{ [key: string]: number }>({});
   const [unavailableItems, setUnavailableItems] = useState<string[]>([]);
 
-  // Sync cart quantities from Firestore
+  // Sync cart quantities from user-scoped cart
   useEffect(() => {
-  const unsubscribe = firestore()
-    .collection("cart")
-    .onSnapshot(snap => {
-      const qtys: any = {};
-      snap.docs.forEach(doc => {
-        const data = doc.data();
-        qtys[data.name] = data.quantity;
-      });
-      setQuantities(qtys);
-    });
-
-  return () => unsubscribe();
-}, []);
-
-  // Fetch unavailable items
-  useEffect(() => {
-  const unsubscribe = firestore()
-    .collection("menu")
-    .where("canteen", "==", "MM_LIBRARY") // 🔥 ONLY THIS FILTER
-    .onSnapshot(snap => {
-      const unavailable: string[] = [];
-
-      snap.docs.forEach(doc => {
-        const data = doc.data();
-        if (data.available === false) {
-          unavailable.push(data.name);
-        }
-      });
-
-      setUnavailableItems(unavailable);
-    });
-
-  return () => unsubscribe();
-}, []);
-
-  const increaseQty = async (name: string, price: number) => {
-  try {
-    const cartRef = firestore().collection("cart");
-    const existing = await cartRef.where("name", "==", name).get();
-
-    if (!existing.empty) {
-      const doc = existing.docs[0];
-      await cartRef.doc(doc.id).update({
-        quantity: doc.data().quantity + 1,
-      });
-    } else {
-      await cartRef.add({
-        name,
-        price,
-        quantity: 1,
-      });
+    const currentUid = auth().currentUser?.uid;
+    if (!currentUid) {
+      setQuantities({});
+      return;
     }
+    const unsubscribe = firestore()
+      .collection("users")
+      .doc(currentUid)
+      .collection("cart")
+      .onSnapshot(snap => {
+        const qtys: any = {};
+        snap.docs.forEach(doc => {
+          const data = doc.data();
+          qtys[doc.id] = data.quantity;
+          if (data.name) qtys[data.name] = data.quantity;
+        });
+        setQuantities(qtys);
+      });
 
-  } catch (err) {
-    console.log("Error:", err);
-  }
-};
+    return () => unsubscribe();
+  }, []);
+
+  // Fetch unavailable items from canteen catalog
+  useEffect(() => {
+    const unsubscribe = firestore()
+      .collection("canteens")
+      .doc("MM_LIBRARY")
+      .collection("items")
+      .where("isAvailable", "==", false)
+      .onSnapshot(snap => {
+        const unavailable: string[] = [];
+        snap.docs.forEach(doc => {
+          const data = doc.data();
+          unavailable.push(doc.id);
+          if (data.name) unavailable.push(data.name);
+        });
+        setUnavailableItems(unavailable);
+      });
+
+    return () => unsubscribe();
+  }, []);
+
+  const increaseQty = async (name: string, _price?: number) => {
+    try {
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const itemId = `mm_lib_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current >= 99) return;
+      await setUserCartItem(currentUid, {
+        itemId,
+        canteenId: "MM_LIBRARY",
+        quantity: current + 1,
+      });
+    } catch (err) {
+      console.log("Error:", err);
+    }
+  };
 
   const decreaseQty = async (name: string) => {
-  try {
-    const cartRef = firestore().collection("cart");
-    const existing = await cartRef.where("name", "==", name).get();
-
-    if (!existing.empty) {
-      const doc = existing.docs[0];
-      const qty = doc.data().quantity;
-
-      if (qty <= 1) {
-        await cartRef.doc(doc.id).delete();
+    try {
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const itemId = `mm_lib_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current <= 1) {
+        await removeUserCartItem(currentUid, itemId);
       } else {
-        await cartRef.doc(doc.id).update({ quantity: qty - 1 });
+        await setUserCartItem(currentUid, {
+          itemId,
+          canteenId: "MM_LIBRARY",
+          quantity: current - 1,
+        });
       }
+    } catch (err) {
+      console.log(err);
     }
-  } catch (err) {
-    console.log(err);
-  }
-};
+  };
 
   const renderCard = (name: string, desc: string, price: number, img: any) => {
-    const isUnavailable = unavailableItems.includes(name);
+    const itemId = `mm_lib_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+    const isUnavailable = unavailableItems.includes(name) || unavailableItems.includes(itemId);
+    const currentQty = quantities[itemId] || quantities[name] || 0;
     return (
       <View key={name} style={[home.card, isUnavailable && { opacity: 0.4 }]}>
         <View style={{ flex: 1 }}>
@@ -115,7 +121,7 @@ export default function MMLibraryScreen() {
               <TouchableOpacity style={home.qtyBtn} onPress={() => decreaseQty(name)}>
                 <Text>-</Text>
               </TouchableOpacity>
-              <Text style={home.price}>₹{price} ({quantities[name] || 0})</Text>
+              <Text style={home.price}>₹{price} ({currentQty})</Text>
               <TouchableOpacity style={home.qtyBtn} onPress={() => increaseQty(name, price)}>
                 <Text>+</Text>
               </TouchableOpacity>

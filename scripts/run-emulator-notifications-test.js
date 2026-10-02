@@ -39,6 +39,7 @@ if (!admin.apps.length) {
   admin.initializeApp({ projectId: PROJECT_ID });
 }
 const db = admin.firestore();
+const { deliverOutboxEvent } = require(path.resolve(__dirname, '../functions/lib/notifications/notificationWorker'));
 
 // --------------------------------------------------------------------------
 // Test Users
@@ -140,6 +141,36 @@ async function sleep(ms) {
 // --------------------------------------------------------------------------
 async function seedTestData() {
   console.log('\n--- Seeding Step 10 Test Data ---');
+
+  // Clean up existing data for test users
+  const allUsers = [USERS.studentA, USERS.studentB, USERS.adminN1, USERS.adminN2, USERS.inactiveAdmin];
+  for (const u of allUsers) {
+    for (const sub of ['notifications', 'orderRequests', 'paymentRequests', 'cart']) {
+      const snap = await db.collection('users').doc(u.uid).collection(sub).get();
+      for (const d of snap.docs) await d.ref.delete();
+    }
+  }
+
+  // Clean up orders created by test students
+  for (const u of [USERS.studentA, USERS.studentB]) {
+    const ordersSnap = await db.collection('orders').where('studentUid', '==', u.uid).get();
+    for (const ord of ordersSnap.docs) {
+      const paySnap = await ord.ref.collection('payments').get();
+      for (const p of paySnap.docs) await p.ref.delete();
+      const histSnap = await ord.ref.collection('paymentHistory').get();
+      for (const h of histSnap.docs) await h.ref.delete();
+      const stSnap = await ord.ref.collection('statusHistory').get();
+      for (const s of stSnap.docs) await s.ref.delete();
+      await ord.ref.delete();
+    }
+  }
+
+  const webhookSnap = await db.collection('webhookEvents').get();
+  for (const d of webhookSnap.docs) {
+    if (d.id.includes('notif') || d.id.includes('NOTIF') || d.id.includes('REPLAY')) {
+      await d.ref.delete();
+    }
+  }
 
   // Admin profiles
   await db.collection('admins').doc(USERS.adminN1.uid).set({
@@ -336,6 +367,22 @@ async function testDirectAccessDenial() {
   // 2.8 createNotificationInternal is NOT exported as a callable or HTTP endpoint
   const internalRes = await callFunction('createNotificationInternal', {}, 'studentA');
   assert(!internalRes.ok && internalRes.status === 404, '2.8 createNotificationInternal is NOT publicly callable (HTTP 404)');
+
+  // 2.9 Direct client read of canonical /notificationOutbox/{outboxId} denied
+  const rootOutboxReadRes = await directFirestoreRest('GET', 'notificationOutbox', 'outbox_test_1', null, 'studentA');
+  assert(!rootOutboxReadRes.ok && (rootOutboxReadRes.status === 403 || rootOutboxReadRes.status === 401), '2.9 Direct student read of /notificationOutbox denied by rules');
+
+  // 2.10 Direct client write (POST) to /notificationOutbox denied
+  const rootOutboxPostRes = await directFirestoreRest('POST', 'notificationOutbox', '', { fields: {} }, 'studentA');
+  assert(!rootOutboxPostRes.ok && (rootOutboxPostRes.status === 403 || rootOutboxPostRes.status === 401), '2.10 Direct client create to /notificationOutbox denied by rules');
+
+  // 2.11 Direct client update (PATCH) to /notificationOutbox denied
+  const rootOutboxPatchRes = await directFirestoreRest('PATCH', 'notificationOutbox', 'outbox_test_1', { fields: {} }, 'studentA');
+  assert(!rootOutboxPatchRes.ok && (rootOutboxPatchRes.status === 403 || rootOutboxPatchRes.status === 401), '2.11 Direct client update to /notificationOutbox denied by rules');
+
+  // 2.12 Direct client delete (DELETE) to /notificationOutbox denied
+  const rootOutboxDeleteRes = await directFirestoreRest('DELETE', 'notificationOutbox', 'outbox_test_1', null, 'studentA');
+  assert(!rootOutboxDeleteRes.ok && (rootOutboxDeleteRes.status === 403 || rootOutboxDeleteRes.status === 401), '2.12 Direct client delete to /notificationOutbox denied by rules');
 }
 
 // ── Suite 3: Input Allowlist Validation ───────────────────────────────────
@@ -418,11 +465,16 @@ async function testOrderPlacedNotifications() {
   assert(typeof orderId === 'string', '4.2 orderId returned from createOrder');
 
   // Wait for async notifications
-  await sleep(3000);
+  let notifs = [];
+  let orderPlacedNotif;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    await sleep(500);
+    notifs = await getNotificationsAdmin(USERS.studentA.uid);
+    orderPlacedNotif = notifs.find((n) => n.type === 'order_placed' && n.orderId === orderId);
+    if (orderPlacedNotif) break;
+  }
 
   // 4.3 Student A receives order_placed notification
-  const notifs = await getNotificationsAdmin(USERS.studentA.uid);
-  const orderPlacedNotif = notifs.find((n) => n.type === 'order_placed' && n.orderId === orderId);
   assert(orderPlacedNotif !== undefined, '4.3 studentA receives order_placed notification');
   assert(orderPlacedNotif?.isRead === false, '4.4 order_placed notification is initially unread');
   assert(typeof orderPlacedNotif?.title === 'string' && orderPlacedNotif.title.length > 0, '4.5 Notification has non-empty title');
@@ -430,8 +482,14 @@ async function testOrderPlacedNotifications() {
   assert(orderPlacedNotif?.notificationId?.startsWith('notif_'), '4.7 Notification ID starts with notif_');
 
   // 4.8 Admin N1 (assigned to CANTEEN_NOTIF_A) receives new_order_for_admin
-  const adminNotifs = await getNotificationsAdmin(USERS.adminN1.uid);
-  const adminOrderNotif = adminNotifs.find((n) => n.type === 'new_order_for_admin' && n.orderId === orderId);
+  let adminNotifs = [];
+  let adminOrderNotif;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    adminNotifs = await getNotificationsAdmin(USERS.adminN1.uid);
+    adminOrderNotif = adminNotifs.find((n) => n.type === 'new_order_for_admin' && n.orderId === orderId);
+    if (adminOrderNotif) break;
+    await sleep(500);
+  }
   assert(adminOrderNotif !== undefined, '4.8 adminN1 receives new_order_for_admin notification');
 
   // 4.9 Admin N2 (NOT assigned to CANTEEN_NOTIF_A) does NOT receive new_order_for_admin
@@ -1345,6 +1403,176 @@ async function testMandatoryEdgeCases() {
   assert(allHaveCreatedAt, '14.12.2 All notifications have valid createdAt timestamp under indefinite-retention policy');
 }
 
+// ── Suite 15: Durable Notification Outbox & Worker Workflow (Phase 3) ─────
+async function testNotificationOutboxWorkflow() {
+  console.log('\n=== Suite 15: Durable Notification Outbox & Worker Workflow ===');
+
+  // 15.1 Transactional creation on createOrder
+  console.log('  Testing 15.1: Transactional outbox creation on createOrder...');
+  const orderRes = await placeTestOrder(USERS.studentA.uid, 'outbox-tx-order-001', 'CANTEEN_NOTIF_A', 'upi_demo');
+  assert(orderRes.ok, '15.1.1 createOrder succeeds');
+  const orderId = orderRes.data?.orderId;
+  assert(typeof orderId === 'string', '15.1.2 orderId returned');
+
+  const studentOutboxId = `outbox_${orderId}_placed_student`;
+  const adminOutboxId = `outbox_${orderId}_placed_admin`;
+
+  const studentOutboxSnap = await db.collection('notificationOutbox').doc(studentOutboxId).get();
+  assert(studentOutboxSnap.exists, '15.1.3 Student outbox document created in /notificationOutbox/{outboxId}');
+  const studentOutboxData = studentOutboxSnap.data();
+  assert(studentOutboxData?.sourceEventId === `${orderId}_placed`, '15.1.4 Outbox sourceEventId matches orderId placed');
+  assert(studentOutboxData?.sourceEventType === 'order', '15.1.5 Outbox sourceEventType is order');
+  assert(studentOutboxData?.recipientRole === 'student', '15.1.6 Outbox recipientRole is student');
+  assert(studentOutboxData?.recipientUid === USERS.studentA.uid, '15.1.7 Outbox recipientUid matches studentA');
+  assert(studentOutboxData?.notificationType === 'order_placed', '15.1.8 Outbox notificationType is order_placed');
+  assert(studentOutboxData?.status === 'delivered' || studentOutboxData?.status === 'pending' || studentOutboxData?.status === 'processing', '15.1.9 Outbox status is valid lifecycle state');
+
+  const adminOutboxSnap = await db.collection('notificationOutbox').doc(adminOutboxId).get();
+  assert(adminOutboxSnap.exists, '15.1.10 Admin outbox document created in /notificationOutbox/{outboxId}');
+  assert(adminOutboxSnap.data()?.canteenId === 'CANTEEN_NOTIF_A', '15.1.11 Admin outbox canteenId matches canteen');
+
+  // 15.2 Transaction abort creates ZERO outbox records
+  console.log('  Testing 15.2: Aborted transaction creates ZERO outbox records...');
+  const abortedAttemptId = 'aborted-order-' + crypto.randomBytes(8).toString('hex');
+  const failedOrderRes = await callFunction('createOrder', {
+    canteenId: 'CANTEEN_NOTIF_A',
+    items: [{ itemId: 'NON_EXISTENT_ITEM_XYZ', quantity: 1, unitPrice: 100 }],
+    paymentMethod: 'upi_demo',
+    idempotencyKey: abortedAttemptId,
+  }, 'studentA');
+  assert(!failedOrderRes.ok, '15.2.1 createOrder with non-existent item fails/aborts');
+  const badOutboxSnap = await db.collection('notificationOutbox').doc(`outbox_${abortedAttemptId}_placed_student`).get();
+  assert(!badOutboxSnap.exists, '15.2.2 Zero outbox documents created when business transaction aborts');
+
+  // 15.3 Repeated source-event attempts do not create conflicting outbox records
+  console.log('  Testing 15.3: Source-event idempotency does not create conflicting outbox records...');
+  const repeatRes = await placeTestOrder(USERS.studentA.uid, 'outbox-tx-order-001', 'CANTEEN_NOTIF_A', 'upi_demo');
+  assert(repeatRes.ok && repeatRes.data?.isRetry === true, '15.3.1 Repeated createOrder call returns idempotent retry');
+  const studentOutboxSnapAfter = await db.collection('notificationOutbox').doc(studentOutboxId).get();
+  assert(studentOutboxSnapAfter.exists, '15.3.2 Existing outbox document remains intact on repeated attempt');
+
+  // 15.4 Payment events outbox creation
+  console.log('  Testing 15.4: Transactional outbox on completeDemoPayment...');
+  const payRes = await callFunction('createDemoPayment', {
+    orderId,
+    idempotencyKey: `notif-outbox-pay-ik-${orderId}`.substring(0, 36),
+  }, 'studentA');
+  assert(payRes.ok, '15.4.1 createDemoPayment succeeds');
+  const paymentId = payRes.data?.paymentId;
+
+  const compRes = await callFunction('completeDemoPayment', {
+    orderId,
+    paymentId,
+  }, 'studentA');
+  assert(compRes.ok, '15.4.2 completeDemoPayment succeeds');
+
+  const payStudentOutboxSnap = await db.collection('notificationOutbox').doc(`outbox_${paymentId}_succeeded_demo_student`).get();
+  assert(payStudentOutboxSnap.exists, '15.4.3 Payment student outbox record exists');
+  assert(payStudentOutboxSnap.data()?.notificationType === 'payment_succeeded_demo', '15.4.4 Payment student notificationType correct');
+
+  const payAdminOutboxSnap = await db.collection('notificationOutbox').doc(`outbox_${paymentId}_succeeded_demo_admin`).get();
+  assert(payAdminOutboxSnap.exists, '15.4.5 Payment admin outbox record exists');
+
+  // 15.5 Status transition outbox creation
+  console.log('  Testing 15.5: Transactional outbox on transitionOrderStatus...');
+  const transRes = await callFunction('transitionOrderStatus', {
+    orderId,
+    targetStatus: 'accepted',
+  }, 'adminN1');
+  assert(transRes.ok, '15.5.1 transitionOrderStatus to accepted succeeds');
+
+  const transOutboxSnap = await db.collection('notificationOutbox').doc(`outbox_${orderId}_payment_verified_to_accepted_student`).get();
+  assert(transOutboxSnap.exists, '15.5.2 Status transition student outbox record exists');
+  assert(transOutboxSnap.data()?.notificationType === 'order_accepted', '15.5.3 Status transition notificationType is order_accepted');
+
+  // 15.6 Delivery idempotency: duplicate worker execution produces zero duplicates
+  console.log('  Testing 15.6: Delivery idempotency on duplicate worker execution...');
+  const manualDelivery1 = await deliverOutboxEvent(`outbox_${paymentId}_succeeded_demo_student`);
+  assert(manualDelivery1.success, '15.6.1 First deliverOutboxEvent succeeds or already delivered');
+
+  const manualDelivery2 = await deliverOutboxEvent(`outbox_${paymentId}_succeeded_demo_student`);
+  assert(manualDelivery2.isIdempotent === true, '15.6.2 Second deliverOutboxEvent recognizes already_delivered (isIdempotent: true)');
+
+  const studentNotifs = await getNotificationsAdmin(USERS.studentA.uid);
+  const paymentSucceededNotifs = studentNotifs.filter(
+    (n) => n.type === 'payment_succeeded_demo' && n.orderId === orderId,
+  );
+  assert(paymentSucceededNotifs.length === 1, '15.6.3 Exactly ONE visible payment_succeeded_demo notification exists (zero duplicate)');
+
+  // 15.7 Deterministic notification ID verification
+  console.log('  Testing 15.7: Deterministic notification ID preservation...');
+  const expectedHash = crypto.createHash('sha256')
+    .update(`${paymentId}_succeeded_demo_${USERS.studentA.uid}_payment_succeeded_demo`)
+    .digest('hex')
+    .substring(0, 32);
+  const expectedNotifId = `notif_${expectedHash}`;
+  assert(paymentSucceededNotifs[0].notificationId === expectedNotifId, '15.7.1 Deterministic notification ID matches formula exactly');
+
+  // 15.8 Retry behavior: transient worker failure increments attemptCount and remains retryable
+  console.log('  Testing 15.8: Transient worker failure increments attemptCount and remains retryable...');
+  const retryTestOutboxId = `outbox_test_transient_${Date.now()}`;
+  await db.collection('notificationOutbox').doc(retryTestOutboxId).set({
+    outboxId: retryTestOutboxId,
+    sourceEventId: 'test_transient_src',
+    sourceEventType: 'order',
+    recipientRole: 'student',
+    notificationType: 'order_placed',
+    status: 'pending',
+    attemptCount: 0,
+    maxAttempts: 5,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  const retryRun1 = await deliverOutboxEvent(retryTestOutboxId);
+  assert(!retryRun1.success && retryRun1.status === 'pending', '15.8.1 Failed attempt remains pending for retry');
+  assert(retryRun1.attemptCount === 1, '15.8.2 Attempt count incremented to 1');
+  assert(retryRun1.errorCategory === 'MISSING_PAYLOAD_FIELD', '15.8.3 Sanitized error category captured');
+
+  const retryDocSnap1 = await db.collection('notificationOutbox').doc(retryTestOutboxId).get();
+  assert(retryDocSnap1.data()?.attemptCount === 1, '15.8.4 Outbox document attemptCount persisted as 1');
+  assert(retryDocSnap1.data()?.status === 'pending', '15.8.5 Outbox document status persisted as pending');
+
+  // 15.9 Dead-letter handling: reaches dead_letter after max attempts (5)
+  console.log('  Testing 15.9: Bounded retries transition to dead_letter after 5 attempts...');
+  await db.collection('notificationOutbox').doc(retryTestOutboxId).update({
+    attemptCount: 4,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  const retryRunFinal = await deliverOutboxEvent(retryTestOutboxId);
+  assert(!retryRunFinal.success && retryRunFinal.status === 'dead_letter', '15.9.1 Outbox event transitions to dead_letter at 5th attempt');
+
+  const deadLetterSnap = await db.collection('notificationOutbox').doc(retryTestOutboxId).get();
+  assert(deadLetterSnap.data()?.status === 'dead_letter', '15.9.2 Dead letter status recorded on outbox document');
+  assert(typeof deadLetterSnap.data()?.lastErrorCode === 'string', '15.9.3 Dead letter error code is sanitized string');
+  assert(!deadLetterSnap.data()?.secret && !deadLetterSnap.data()?.token, '15.9.4 Dead letter document contains zero secrets or tokens');
+
+  // 15.10 Dead-letter on malformed schema
+  console.log('  Testing 15.10: Immediate dead_letter on malformed event schema...');
+  const malformedOutboxId = `outbox_test_malformed_${Date.now()}`;
+  await db.collection('notificationOutbox').doc(malformedOutboxId).set({
+    outboxId: malformedOutboxId,
+    status: 'pending',
+    attemptCount: 0,
+    maxAttempts: 5,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  const malformedRun = await deliverOutboxEvent(malformedOutboxId);
+  assert(!malformedRun.success && malformedRun.status === 'dead_letter', '15.10.1 Malformed schema immediately dead-lettered');
+  assert(malformedRun.errorCategory === 'MALFORMED_EVENT_SCHEMA', '15.10.2 Error code is MALFORMED_EVENT_SCHEMA');
+
+  // 15.11 Zero business state mutation
+  console.log('  Testing 15.11: Verification that worker never mutates order, payment, refund, or slot state...');
+  const finalOrderSnap = await db.collection('orders').doc(orderId).get();
+  assert(finalOrderSnap.exists && finalOrderSnap.data()?.status === 'accepted', '15.11.1 Order status remains accepted');
+
+  const finalPaySnap = await db.collection('orders').doc(orderId).collection('payments').doc(paymentId).get();
+  assert(finalPaySnap.exists && finalPaySnap.data()?.status === 'succeeded_demo', '15.11.2 Payment status remains succeeded_demo');
+}
+
 // --------------------------------------------------------------------------
 // MAIN
 // --------------------------------------------------------------------------
@@ -1374,6 +1602,7 @@ async function main() {
     await testPrivacy();
     await testTemplateSanitization();
     await testMandatoryEdgeCases();
+    await testNotificationOutboxWorkflow();
 
   } catch (err) {
     console.error('\nFATAL: Test runner error:', err?.message || err);

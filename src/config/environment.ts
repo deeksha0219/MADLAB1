@@ -58,7 +58,7 @@ const STAGING_CONFIG: EnvironmentConfig = {
   environment: 'staging',
   projectId: 'mad-lab-a9665',
   useEmulator: false,
-  enableDebugLogs: true,
+  enableDebugLogs: false,
   clientCallsFunctionsEmulator: false,
 };
 
@@ -109,9 +109,15 @@ export function getActiveEnvironmentConfig(): EnvironmentConfig {
 }
 
 /**
- * Sets the active environment. Rejects invalid environments and production.
+ * Sets the active environment. Rejects invalid environments, production,
+ * and runtime switching outside local development.
  */
 export function setActiveEnvironment(env: AppEnvironment): void {
+  if (!isDev) {
+    throw new Error(
+      '[SECURITY ERROR] Runtime environment switching is strictly forbidden outside local development.',
+    );
+  }
   // Validate before applying
   resolveEnvironmentConfig(env);
   currentEnvironment = env;
