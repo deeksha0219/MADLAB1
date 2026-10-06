@@ -1,0 +1,8 @@
+node_modules/
+functions/
+backend/
+android/
+ios/
+Pods/
+coverage/
+*.log

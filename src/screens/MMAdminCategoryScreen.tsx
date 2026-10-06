@@ -11,6 +11,8 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import MaterialIcon from "react-native-vector-icons/MaterialIcons";
 import { categoryStyles as styles } from "../styles/Studentstyles";
 import firestore from "@react-native-firebase/firestore";
+import auth from "@react-native-firebase/auth";
+import { setUserCartItem, removeUserCartItem } from "../services/orderService";
 
 const foodImages: any = {
   "Veg Puff": require("../../assets/veg_puff.png"),
@@ -42,70 +44,87 @@ export default function MMAdminCategoryScreen({ route, navigation }: any) {
   const { category } = route.params;
 
   const [items, setItems] = useState<any[]>([]);
-  const [quantities, setQuantities] = useState<{ [key: string]: number }>({}); // ✅ NEW
+  const [quantities, setQuantities] = useState<{ [key: string]: number }>({});
 
   useEffect(() => {
     const unsubscribe = firestore()
-      .collection("menu")
-      .where("category", "==", category)
-      .where("canteen", "==", "MM_ADMIN_BLOCK")
+      .collection("canteens")
+      .doc("MM_ADMIN_BLOCK")
+      .collection("items")
+      .where("categoryId", "==", category)
       .onSnapshot(snapshot => {
-        const data = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-        }));
+        const data = snapshot.docs.map(doc => {
+          const d = doc.data();
+          return {
+            id: doc.id,
+            name: d.name,
+            price: typeof d.priceInPaise === "number" ? Math.floor(d.priceInPaise / 100) : (d.price || 0),
+            priceInPaise: d.priceInPaise,
+            desc: d.description || d.desc || "",
+            available: d.isAvailable !== false,
+          };
+        });
         setItems(data);
       });
 
     return () => unsubscribe();
-  }, []);
+  }, [category]);
 
-  // ✅ NEW — sync cart quantities live
+  // Sync cart quantities live from user cart
   useEffect(() => {
+    const currentUid = auth().currentUser?.uid;
+    if (!currentUid) {
+      setQuantities({});
+      return;
+    }
     const unsubscribe = firestore()
+      .collection("users")
+      .doc(currentUid)
       .collection("cart")
       .onSnapshot(snap => {
         const qtys: { [key: string]: number } = {};
         snap.docs.forEach(doc => {
           const data = doc.data();
-          qtys[data.name] = data.quantity;
+          qtys[doc.id] = data.quantity;
+          if (data.name) qtys[data.name] = data.quantity;
         });
         setQuantities(qtys);
       });
     return () => unsubscribe();
   }, []);
 
-  // ✅ NEW
-  const increaseQty = async (name: string, price: number) => {
+  const increaseQty = async (itemId: string, name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
-
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        await cartRef.doc(doc.id).update({ quantity: doc.data().quantity + 1 });
-      } else {
-        await cartRef.add({ name, price, quantity: 1 });
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) {
+        Alert.alert("Error", "Please sign in to add items.");
+        return;
       }
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current >= 99) return;
+      await setUserCartItem(currentUid, {
+        itemId,
+        canteenId: "MM_ADMIN_BLOCK",
+        quantity: current + 1,
+      });
     } catch (err: any) {
       Alert.alert("Error", err.message);
     }
   };
 
-  // ✅ NEW
-  const decreaseQty = async (name: string) => {
+  const decreaseQty = async (itemId: string, name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
-
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        const qty = doc.data().quantity;
-        if (qty <= 1) {
-          await cartRef.doc(doc.id).delete();
-        } else {
-          await cartRef.doc(doc.id).update({ quantity: qty - 1 });
-        }
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current <= 1) {
+        await removeUserCartItem(currentUid, itemId);
+      } else {
+        await setUserCartItem(currentUid, {
+          itemId,
+          canteenId: "MM_ADMIN_BLOCK",
+          quantity: current - 1,
+        });
       }
     } catch (err: any) {
       Alert.alert("Error", err.message);
@@ -126,7 +145,8 @@ export default function MMAdminCategoryScreen({ route, navigation }: any) {
         </View>
 
         {items.map(item => {
-          const qty = quantities[item.name] || 0; // ✅ NEW
+          const itemId = item.id || `mm_admin_${item.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+          const qty = quantities[itemId] || quantities[item.name] || 0;
 
           return (
             <View
@@ -148,7 +168,7 @@ export default function MMAdminCategoryScreen({ route, navigation }: any) {
                 </Text>
               )}
 
-              {/* ✅ NEW — stepper replaces button once item is in cart */}
+              {/* stepper replaces button once item is in cart */}
               {item.available && qty > 0 ? (
                 <View style={{
                   flexDirection: "row",
@@ -159,14 +179,14 @@ export default function MMAdminCategoryScreen({ route, navigation }: any) {
                   paddingVertical: 8,
                 }}>
                   <TouchableOpacity
-                    onPress={() => decreaseQty(item.name)}
+                    onPress={() => decreaseQty(itemId, item.name)}
                     style={{ paddingHorizontal: 18 }}
                   >
                     <Text style={{ color: "#fff", fontSize: 18, fontWeight: "bold" }}>-</Text>
                   </TouchableOpacity>
                   <Text style={{ color: "#fff", fontSize: 16, fontWeight: "bold" }}>{qty}</Text>
                   <TouchableOpacity
-                    onPress={() => increaseQty(item.name, item.price)}
+                    onPress={() => increaseQty(itemId, item.name)}
                     style={{ paddingHorizontal: 18 }}
                   >
                     <Text style={{ color: "#fff", fontSize: 18, fontWeight: "bold" }}>+</Text>
@@ -179,7 +199,7 @@ export default function MMAdminCategoryScreen({ route, navigation }: any) {
                     !item.available && { backgroundColor: "#ccc" }
                   ]}
                   disabled={!item.available}
-                  onPress={() => increaseQty(item.name, item.price)}
+                  onPress={() => increaseQty(itemId, item.name)}
                 >
                   <Text style={styles.buttonText}>
                     {item.available ? "Add To Tummy" : "Unavailable"}

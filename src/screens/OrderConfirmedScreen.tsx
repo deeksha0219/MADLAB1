@@ -55,19 +55,32 @@ const OrderConfirmed = () => {
           <Text style={{ color: "gray" }}>Order ID</Text>
           <Text style={{ fontWeight: "bold" }}>{orderId}</Text>
         </View>
-        <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", marginBottom: 8 }}>
           <Text style={{ color: "gray" }}>Reference ID</Text>
           <Text style={{ fontWeight: "bold" }}>{referenceId}</Text>
         </View>
+        <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+          <Text style={{ color: "gray" }}>Payment</Text>
+          <Text style={{ fontWeight: "bold", color: "#D97706" }}>Demo Mode (Simulated)</Text>
+        </View>
       </View>
 
-      {/* Button */}
-      <TouchableOpacity
-        style={orderstyles.button}
-        onPress={() => navigation.navigate("Home")}
-      >
-        <Text style={orderstyles.buttonText}>Back To Home</Text>
-      </TouchableOpacity>
+      {/* Action Buttons */}
+      <View style={{ width: "100%", marginTop: 24, gap: 12 }}>
+        <TouchableOpacity
+          style={[orderstyles.button, { backgroundColor: "#10B981" }]}
+          onPress={() => (navigation as any).navigate("OrderHistory")}
+        >
+          <Text style={orderstyles.buttonText}>Track Order Status</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={orderstyles.button}
+          onPress={() => navigation.navigate("Home")}
+        >
+          <Text style={orderstyles.buttonText}>Back To Home</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 };

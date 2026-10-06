@@ -12,90 +12,49 @@ import {
   KeyboardAvoidingView,
   Platform,
 } from "react-native";
-
 import { loginStyles } from "../styles/Studentstyles";
 import {
-  getFirestore,
-  collection,
-  query,
-  where,
-  getDocs,
-} from "@react-native-firebase/firestore";
-import auth from "@react-native-firebase/auth";
-import { getApp } from "@react-native-firebase/app";
+  requestPhoneOtp,
+  confirmPhoneOtp,
+} from "../services/authService";
 
 type Props = {
-  setRole: (role: "student" | "Service Desk") => void;
+  navigation?: any;
+  onNavigateToRegister?: () => void;
 };
 
-export default function LoginScreen({ setRole }: Props) {
+export default function LoginScreen({ navigation, onNavigateToRegister }: Props) {
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState("");
   const [loading, setLoading] = useState(false);
   const [otpSent, setOtpSent] = useState(false);
-  const [confirm, setConfirm] = useState<any>(null);
+  const [confirmResult, setConfirmResult] = useState<any>(null);
 
-  // ScrollView reference
   const scrollViewRef = useRef<ScrollView>(null);
-
-  const app = getApp();
-  const db = getFirestore(app);
 
   // --------------------------------------------------
   // SEND OTP
   // --------------------------------------------------
-
   const handleSendOtp = async () => {
-    if (phone.length !== 10) {
-      Alert.alert(
-        "Error",
-        "Enter valid 10-digit phone number!"
-      );
+    const cleanPhone = phone.trim();
+    if (!cleanPhone || cleanPhone.length !== 10) {
+      Alert.alert("Invalid Phone", "Please enter a valid 10-digit mobile number.");
       return;
     }
 
     setLoading(true);
-
     try {
-      auth().settings.appVerificationDisabledForTesting = true;
-
-      const snap = await getDocs(
-        query(
-          collection(db, "users"),
-          where("phone", "==", phone)
-        )
-      );
-
-      if (snap.empty) {
-        Alert.alert(
-          "Error",
-          "Phone not registered!"
-        );
+      const result = await requestPhoneOtp(cleanPhone);
+      if (!result.success || !result.confirmation) {
+        Alert.alert("Error", result.error || "Failed to send OTP.");
         return;
       }
 
-      const confirmation =
-        await auth().signInWithPhoneNumber(
-          `+91${phone}`
-        );
-
-      setConfirm(confirmation);
+      setConfirmResult(result.confirmation);
       setOtpSent(true);
-
-      Alert.alert("OTP Sent!");
-
+      Alert.alert("OTP Sent", "A 6-digit verification code has been sent to your phone.");
     } catch (err: any) {
-      console.log(
-        "ERROR:",
-        err.code,
-        err.message
-      );
-
-      Alert.alert(
-        "Error",
-        err.message
-      );
-
+      Alert.alert("Error", err.message || "Failed to send OTP.");
     } finally {
       setLoading(false);
     }
@@ -104,37 +63,29 @@ export default function LoginScreen({ setRole }: Props) {
   // --------------------------------------------------
   // VERIFY OTP
   // --------------------------------------------------
-
   const handleVerifyOtp = async () => {
-    if (!otp || otp.length < 6) {
-      Alert.alert(
-        "Error",
-        "Enter valid 6-digit OTP!"
-      );
+    const cleanOtp = otp.trim();
+    if (!cleanOtp || cleanOtp.length !== 6) {
+      Alert.alert("Invalid OTP", "Enter the complete 6-digit verification code.");
       return;
     }
 
-    if (!confirm) {
-      Alert.alert(
-        "Error",
-        "Request OTP first!"
-      );
+    if (!confirmResult) {
+      Alert.alert("Error", "Please request an OTP first.");
       return;
     }
 
     setLoading(true);
-
     try {
-      await confirm.confirm(otp);
+      const result = await confirmPhoneOtp(confirmResult, cleanOtp);
+      if (!result.success) {
+        Alert.alert("Verification Failed", result.error || "Invalid OTP code.");
+        return;
+      }
 
-      setRole("student");
-
+      // Successful sign in automatically triggers onAuthStateChanged in AppNavigator
     } catch (err: any) {
-      Alert.alert(
-        "Error",
-        "Wrong OTP!"
-      );
-
+      Alert.alert("Error", err.message || "Verification failed.");
     } finally {
       setLoading(false);
     }
@@ -143,49 +94,41 @@ export default function LoginScreen({ setRole }: Props) {
   // --------------------------------------------------
   // RESEND OTP
   // --------------------------------------------------
-
   const handleResendOtp = async () => {
     setOtp("");
-    setConfirm(null);
+    setConfirmResult(null);
     setOtpSent(false);
 
-    // Wait for state update before sending again
     setTimeout(() => {
       handleSendOtp();
-    }, 100);
+    }, 150);
   };
 
-  // --------------------------------------------------
-  // SCREEN
-  // --------------------------------------------------
+  const handleGoToRegister = () => {
+    if (onNavigateToRegister) {
+      onNavigateToRegister();
+    } else if (navigation?.navigate) {
+      navigation.navigate("Account");
+    }
+  };
 
   return (
     <SafeAreaView style={loginStyles.container}>
-
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={
-          Platform.OS === "ios"
-            ? "padding"
-            : "height"
-        }
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
       >
-
         <ScrollView
           ref={scrollViewRef}
           contentContainerStyle={[
             loginStyles.scrollContent,
-            {
-              paddingBottom: 40,
-            },
+            { paddingBottom: 40 },
           ]}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
           bounces={false}
         >
-
           {/* LOGO */}
-
           <Image
             source={require("../../assets/logo_text.png")}
             style={loginStyles.logo}
@@ -193,23 +136,12 @@ export default function LoginScreen({ setRole }: Props) {
           />
 
           {/* WELCOME */}
-
-          <Text style={loginStyles.welcome}>
-            Welcome! 👋
-          </Text>
-
-          <Text style={loginStyles.subText}>
-            Ready to skip the queue today?
-          </Text>
+          <Text style={loginStyles.welcome}>Welcome! 👋</Text>
+          <Text style={loginStyles.subText}>Ready to skip the queue today?</Text>
 
           {/* PHONE NUMBER */}
-
           <View style={loginStyles.phoneContainer}>
-
-            <Text style={loginStyles.countryCode}>
-              +91 |
-            </Text>
-
+            <Text style={loginStyles.countryCode}>+91 |</Text>
             <TextInput
               placeholder="Enter Mobile Number"
               placeholderTextColor="#555"
@@ -218,49 +150,28 @@ export default function LoginScreen({ setRole }: Props) {
               maxLength={10}
               value={phone}
               onChangeText={setPhone}
-              editable={!otpSent}
+              editable={!otpSent && !loading}
             />
 
             <TouchableOpacity
               style={[
                 loginStyles.otpButton,
-                otpSent && {
-                  backgroundColor: "gray",
-                },
+                otpSent && { backgroundColor: "gray" },
               ]}
-              onPress={
-                otpSent
-                  ? undefined
-                  : handleSendOtp
-              }
-              disabled={
-                loading || otpSent
-              }
+              onPress={otpSent ? undefined : handleSendOtp}
+              disabled={loading || otpSent}
             >
-
               {loading && !otpSent ? (
-                <ActivityIndicator
-                  color="#fff"
-                  size="small"
-                />
+                <ActivityIndicator color="#fff" size="small" />
               ) : (
-                <Text
-                  style={
-                    loginStyles.otpButtonText
-                  }
-                >
-                  {otpSent
-                    ? "Sent ✓"
-                    : "Get OTP"}
+                <Text style={loginStyles.otpButtonText}>
+                  {otpSent ? "Sent ✓" : "Get OTP"}
                 </Text>
               )}
-
             </TouchableOpacity>
-
           </View>
 
           {/* OTP INPUT */}
-
           <TextInput
             placeholder="Enter OTP"
             placeholderTextColor="#555"
@@ -269,78 +180,52 @@ export default function LoginScreen({ setRole }: Props) {
             maxLength={6}
             value={otp}
             onChangeText={setOtp}
-
-            // ⭐ AUTOMATICALLY MOVE SCREEN UP
-            // WHEN KEYBOARD OPENS
+            editable={otpSent && !loading}
             onFocus={() => {
               setTimeout(() => {
-                scrollViewRef.current?.scrollToEnd({
-                  animated: true,
-                });
+                scrollViewRef.current?.scrollToEnd({ animated: true });
               }, 250);
             }}
           />
 
           {/* RESEND */}
-
-          <View
-            style={{
-              flexDirection: "row",
-              marginTop: 12,
-              alignItems: "center",
-            }}
-          >
-
-            <Text
-              style={
-                loginStyles.resendText
-              }
-            >
-              Didn't receive OTP?
-            </Text>
-
-            <Text
-              style={loginStyles.resend}
-              onPress={handleResendOtp}
-            >
-              {" "}Resend
-            </Text>
-
+          <View style={{ flexDirection: "row", marginTop: 12, alignItems: "center" }}>
+            <Text style={loginStyles.resendText}>Didn't receive OTP?</Text>
+            <TouchableOpacity onPress={otpSent ? handleResendOtp : undefined} disabled={loading || !otpSent}>
+              <Text style={[loginStyles.resend, !otpSent && { color: "gray" }]}> Resend</Text>
+            </TouchableOpacity>
           </View>
 
           {/* VERIFY BUTTON */}
-
           <TouchableOpacity
             style={[
               loginStyles.verifyButton,
-              loading && {
-                opacity: 0.6,
-              },
+              (loading || !otpSent) && { opacity: 0.6 },
             ]}
             onPress={handleVerifyOtp}
-            disabled={loading}
+            disabled={loading || !otpSent}
           >
-
             {loading && otpSent ? (
-              <ActivityIndicator
-                color="#fff"
-              />
+              <ActivityIndicator color="#fff" />
             ) : (
-              <Text
-                style={
-                  loginStyles.verifyButtonText
-                }
-              >
-                VERIFY OTP
-              </Text>
+              <Text style={loginStyles.verifyButtonText}>VERIFY & LOGIN</Text>
             )}
-
           </TouchableOpacity>
 
+          {/* CREATE ACCOUNT LINK */}
+          <TouchableOpacity
+            onPress={handleGoToRegister}
+            style={{ marginTop: 24, alignSelf: "center" }}
+          >
+            <Text style={{ fontSize: 14, color: "#666" }}>
+              New to GrabNGo?{" "}
+              <Text style={{ color: "#E0533C", fontWeight: "bold" }}>
+                Create Account
+              </Text>
+            </Text>
+          </TouchableOpacity>
         </ScrollView>
-
       </KeyboardAvoidingView>
-
     </SafeAreaView>
   );
 }

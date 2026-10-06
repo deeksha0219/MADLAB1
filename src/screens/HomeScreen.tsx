@@ -5,10 +5,13 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import MaterialIcon from "react-native-vector-icons/MaterialIcons";
-import FeatherIcon from "react-native-vector-icons/Feather";
 import { home as Homestyles } from "../styles/Studentstyles";
 import { useNavigation } from "@react-navigation/native";
 import firestore from "@react-native-firebase/firestore";
+import auth from "@react-native-firebase/auth";
+import { getActiveCanteens, Canteen } from "../services/catalogService";
+import { setUserCartItem, removeUserCartItem } from "../services/orderService";
+import NotificationBell from "../components/NotificationBell";
 
 export default function HomeScreen() {
   const navigation = useNavigation<any>();
@@ -18,13 +21,37 @@ export default function HomeScreen() {
   const [unavailableItems, setUnavailableItems] = useState<string[]>([]);
   const [selectedCanteen, setSelectedCanteen] = useState<string>("BIG MINGOS");
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
+  const [canteensList, setCanteensList] = useState<Canteen[]>([]);
+  const [_canteenLoading, setCanteenLoading] = useState<boolean>(false);
+  const [_canteenError, setCanteenError] = useState<string | null>(null);
 
-  // ✅ FETCH UNAVAILABLE ITEMS FROM FIRESTORE
+  // Fetch active canteens from Firestore with retry support
+  const loadCanteens = async () => {
+    setCanteenLoading(true);
+    setCanteenError(null);
+    try {
+      const list = await getActiveCanteens();
+      if (list && list.length > 0) {
+        setCanteensList(list);
+      }
+    } catch {
+      setCanteenError("Using cached canteen list");
+    } finally {
+      setCanteenLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadCanteens();
+  }, []);
+
+  // ✅ FETCH UNAVAILABLE ITEMS FROM CANTEEN CATALOG
   useEffect(() => {
     const unsubscribe = firestore()
-      .collection("menu")
-      .where("available", "==", false)
-      .where("canteen", "==", "BIG_MINGOS")
+      .collection("canteens")
+      .doc("BIG_MINGOS")
+      .collection("items")
+      .where("isAvailable", "==", false)
       .onSnapshot(snap => {
         const names = snap.docs.map(doc => doc.data().name);
         setUnavailableItems(names);
@@ -32,48 +59,58 @@ export default function HomeScreen() {
     return () => unsubscribe();
   }, []);
 
-  // ✅ SYNC CART QUANTITIES FROM FIRESTORE
+  // ✅ SYNC CART QUANTITIES FROM USER-SCOPED CART
   useEffect(() => {
+    const currentUid = auth().currentUser?.uid;
+    if (!currentUid) {
+      setQuantities({});
+      return;
+    }
     const unsubscribe = firestore()
+      .collection("users")
+      .doc(currentUid)
       .collection("cart")
       .onSnapshot(snap => {
         const qtys: { [key: string]: number } = {};
         snap.docs.forEach(doc => {
           const data = doc.data();
-          qtys[data.name] = data.quantity;
+          qtys[doc.id] = data.quantity;
+          if (data.name) qtys[data.name] = data.quantity;
         });
         setQuantities(qtys);
       });
     return () => unsubscribe();
   }, []);
 
-  const increaseQty = async (name: string, price: number) => {
+  const increaseQty = async (itemId: string, name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        await cartRef.doc(doc.id).update({ quantity: doc.data().quantity + 1 });
-      } else {
-        await cartRef.add({ name, price, quantity: 1 });
-      }
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current >= 99) return;
+      await setUserCartItem(currentUid, {
+        itemId,
+        canteenId: "BIG_MINGOS",
+        quantity: current + 1,
+      });
     } catch (err) {
       console.log("Error adding to cart:", err);
     }
   };
 
-  const decreaseQty = async (name: string) => {
+  const decreaseQty = async (itemId: string, name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
-      const existing = await cartRef.where("name", "==", name).get();
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        const qty = doc.data().quantity;
-        if (qty <= 1) {
-          await cartRef.doc(doc.id).delete();
-        } else {
-          await cartRef.doc(doc.id).update({ quantity: qty - 1 });
-        }
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current <= 1) {
+        await removeUserCartItem(currentUid, itemId);
+      } else {
+        await setUserCartItem(currentUid, {
+          itemId,
+          canteenId: "BIG_MINGOS",
+          quantity: current - 1,
+        });
       }
     } catch (err) {
       console.log("Error decreasing cart:", err);
@@ -130,7 +167,9 @@ export default function HomeScreen() {
     : [];
 
   const renderFoodCard = (item: any) => {
+    const itemId = item.id || `demo_${item.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
     const isUnavailable = unavailableItems.includes(item.name) && selectedCanteen === "BIG MINGOS";
+    const currentQty = quantities[itemId] || quantities[item.name] || 0;
     return (
       <View key={item.name} style={[Homestyles.card, isUnavailable && { opacity: 0.4 }]}>
         <View style={{ flex: 1 }}>
@@ -142,13 +181,13 @@ export default function HomeScreen() {
             </Text>
           ) : (
             <View style={Homestyles.priceRow}>
-              <TouchableOpacity style={Homestyles.qtyBtn} onPress={() => decreaseQty(item.name)}>
+              <TouchableOpacity style={Homestyles.qtyBtn} onPress={() => decreaseQty(itemId, item.name)}>
                 <Text>-</Text>
               </TouchableOpacity>
               <Text style={Homestyles.price}>
-                ₹{item.price} ({quantities[item.name] || 0})
+                ₹{item.price} ({currentQty})
               </Text>
-              <TouchableOpacity style={Homestyles.qtyBtn} onPress={() => increaseQty(item.name, item.price)}>
+              <TouchableOpacity style={Homestyles.qtyBtn} onPress={() => increaseQty(itemId, item.name)}>
                 <Text>+</Text>
               </TouchableOpacity>
             </View>
@@ -184,7 +223,7 @@ export default function HomeScreen() {
               style={Homestyles.logoCenter}
             />
 
-            <FeatherIcon name="bell" size={30} color="black" />
+            <NotificationBell color="black" size={28} />
           </View>
 
           {/* ✅ CANTEEN DROPDOWN MODAL */}
@@ -195,7 +234,10 @@ export default function HomeScreen() {
               style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.20)", justifyContent: "flex-start", paddingTop: 90, alignItems: "center" }}
             >
               <View style={{ width: "72%", backgroundColor: "#fff", borderRadius: 18, paddingVertical: 8, elevation: 8 }}>
-                {["BIG MINGOS", "M.M Foods (Library)", "M.M Foods (Admin Block)"].map((item, index) => (
+                {(canteensList.length > 0
+                  ? canteensList.map(c => c.name)
+                  : ["BIG MINGOS", "M.M Foods (Library)", "M.M Foods (Admin Block)"]
+                ).map((item, index, arr) => (
                   <TouchableOpacity
                     key={item}
                     onPress={() => {
@@ -204,7 +246,7 @@ export default function HomeScreen() {
                       if (item === "M.M Foods (Admin Block)") navigation.navigate("MMAdminBlock");
                       if (item === "M.M Foods (Library)") navigation.navigate("MMLibrary");
                     }}
-                    style={{ paddingVertical: 16, paddingHorizontal: 18, borderBottomWidth: index !== 2 ? 1 : 0, borderBottomColor: "#f1f1f1" }}
+                    style={{ paddingVertical: 16, paddingHorizontal: 18, borderBottomWidth: index !== arr.length - 1 ? 1 : 0, borderBottomColor: "#f1f1f1" }}
                   >
                     <Text style={{ fontSize: 16, fontWeight: "600", color: selectedCanteen === item ? "#E53935" : "#222" }}>
                       {item}

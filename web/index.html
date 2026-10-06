@@ -1,0 +1,1280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>GrabNGo — Touch-Screen Service Desk & Operations</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #0b0f19;
+      --bg-surface: #121827;
+      --bg-card: #1a2236;
+      --bg-card-hover: #222d47;
+      --border-color: #2a3652;
+      --border-focus: #4f46e5;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --primary: #4f46e5;
+      --primary-hover: #4338ca;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --info: #06b6d4;
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --radius-full: 9999px;
+      --shadow-sm: 0 2px 4px rgba(0,0,0,0.3);
+      --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+      --shadow-lg: 0 10px 30px rgba(0,0,0,0.5);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+
+    body {
+      font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+    }
+
+    /* TOP HEADER */
+    header {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-color);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .brand-section {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .brand-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+    }
+
+    .brand-icon {
+      width: 44px;
+      height: 44px;
+      background: linear-gradient(135deg, #DF401C, #f97316);
+      border-radius: var(--radius-md);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      box-shadow: 0 4px 12px rgba(223, 64, 28, 0.4);
+    }
+
+    .brand-title {
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: #fff;
+    }
+
+    .brand-badge {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      background: rgba(79, 70, 229, 0.2);
+      color: #818cf8;
+      border: 1px solid rgba(129, 140, 248, 0.3);
+      padding: 3px 8px;
+      border-radius: var(--radius-full);
+      margin-left: 8px;
+    }
+
+    .canteen-selector {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 10px 16px;
+      border-radius: var(--radius-md);
+      font-size: 14px;
+      font-weight: 600;
+      outline: none;
+      cursor: pointer;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    /* KEYBOARD TOGGLE BUTTON */
+    .keyboard-toggle-btn {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--bg-card);
+      border: 2px solid var(--border-color);
+      color: var(--text-main);
+      padding: 10px 18px;
+      border-radius: var(--radius-full);
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s;
+      min-height: 48px;
+    }
+
+    .keyboard-toggle-btn.active {
+      border-color: var(--success);
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+    }
+
+    .operator-profile {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--bg-card);
+      padding: 6px 14px;
+      border-radius: var(--radius-full);
+      border: 1px solid var(--border-color);
+      font-size: 13px;
+    }
+
+    .operator-role-tag {
+      background: #374151;
+      padding: 3px 8px;
+      border-radius: var(--radius-sm);
+      font-size: 11px;
+      font-weight: 600;
+      color: #e5e7eb;
+    }
+
+    .btn-logout {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #f87171;
+      padding: 10px 16px;
+      border-radius: var(--radius-md);
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      min-height: 48px;
+      transition: all 0.2s;
+    }
+
+    .btn-logout:hover {
+      background: rgba(239, 68, 68, 0.3);
+    }
+
+    /* MAIN CONTAINER */
+    main {
+      flex: 1;
+      padding: 24px;
+      max-width: 1440px;
+      margin: 0 auto;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      padding-bottom: 260px; /* Space for virtual keyboard */
+    }
+
+    /* SEARCH BAR */
+    .search-panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .search-input-wrapper {
+      flex: 1;
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+
+    .search-input {
+      width: 100%;
+      background: var(--bg-card);
+      border: 2px solid var(--border-color);
+      color: var(--text-main);
+      padding: 14px 20px;
+      padding-left: 48px;
+      border-radius: var(--radius-md);
+      font-size: 16px;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+      outline: none;
+      transition: border-color 0.2s;
+      min-height: 52px;
+    }
+
+    .search-input:focus {
+      border-color: var(--border-focus);
+    }
+
+    .search-icon-prefix {
+      position: absolute;
+      left: 18px;
+      color: var(--text-dim);
+      font-size: 18px;
+      pointer-events: none;
+    }
+
+    .btn-action {
+      background: var(--primary);
+      color: white;
+      border: none;
+      padding: 14px 24px;
+      border-radius: var(--radius-md);
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 52px;
+      transition: background 0.2s;
+    }
+
+    .btn-action:hover {
+      background: var(--primary-hover);
+    }
+
+    .btn-action:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 14px 20px;
+      border-radius: var(--radius-md);
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      min-height: 52px;
+    }
+
+    /* FILTER TABS */
+    .filter-bar {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      padding-bottom: 6px;
+    }
+
+    .filter-tab {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 10px 18px;
+      border-radius: var(--radius-full);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.2s;
+      min-height: 44px;
+    }
+
+    .filter-tab.active {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+    }
+
+    /* ORDER GRID */
+    .orders-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+      gap: 20px;
+    }
+
+    .order-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: var(--shadow-sm);
+      transition: all 0.2s;
+    }
+
+    .order-card:hover {
+      border-color: #3b82f6;
+      box-shadow: var(--shadow-md);
+    }
+
+    .order-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .order-ref {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 18px;
+      font-weight: 800;
+      color: #fff;
+    }
+
+    .order-id-sub {
+      font-size: 12px;
+      color: var(--text-dim);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .status-badge {
+      padding: 5px 12px;
+      border-radius: var(--radius-full);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .status-placed { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(96, 165, 250, 0.4); }
+    .status-payment_verified { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.4); }
+    .status-accepted { background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(192, 132, 252, 0.4); }
+    .status-preparing { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.4); }
+    .status-ready_for_pickup { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.4); }
+    .status-completed { background: rgba(100, 116, 139, 0.2); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.4); }
+    .status-cancelled, .status-rejected { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.4); }
+
+    .order-items-list {
+      background: var(--bg-card);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 13px;
+    }
+
+    .order-item-row {
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .order-meta-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .order-total {
+      font-size: 18px;
+      font-weight: 800;
+      color: #fff;
+    }
+
+    .order-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 4px;
+    }
+
+    .btn-status {
+      flex: 1;
+      padding: 12px 14px;
+      border-radius: var(--radius-md);
+      font-size: 14px;
+      font-weight: 700;
+      border: none;
+      cursor: pointer;
+      min-height: 48px;
+      transition: all 0.15s;
+    }
+
+    .btn-accept { background: #10b981; color: #fff; }
+    .btn-accept:hover { background: #059669; }
+
+    .btn-prepare { background: #f59e0b; color: #111; }
+    .btn-prepare:hover { background: #d97706; }
+
+    .btn-ready { background: #06b6d4; color: #fff; }
+    .btn-ready:hover { background: #0891b2; }
+
+    .btn-complete { background: #3b82f6; color: #fff; }
+    .btn-complete:hover { background: #2563eb; }
+
+    .btn-details {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 12px 14px;
+      border-radius: var(--radius-md);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      min-height: 48px;
+    }
+
+    /* IN-SCREEN VIRTUAL KEYBOARD */
+    .touch-keyboard-container {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #111827;
+      border-top: 2px solid #374151;
+      box-shadow: 0 -10px 40px rgba(0,0,0,0.7);
+      padding: 12px 16px 18px 16px;
+      z-index: 50;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transform: translateY(100%);
+      transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .touch-keyboard-container.visible {
+      transform: translateY(0);
+    }
+
+    .keyboard-top-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 4px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .keyboard-char-counter {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+    }
+
+    .btn-hide-keyboard {
+      background: #374151;
+      border: none;
+      color: #fff;
+      padding: 6px 14px;
+      border-radius: var(--radius-full);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .keyboard-row {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+    }
+
+    .k-key {
+      min-width: 52px;
+      height: 52px;
+      background: #1f2937;
+      border: 1px solid #374151;
+      border-radius: var(--radius-md);
+      color: #fff;
+      font-size: 18px;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.1s, transform 0.05s;
+      flex: 1;
+      max-width: 72px;
+      box-shadow: 0 2px 0 #111827;
+    }
+
+    .k-key:active {
+      transform: translateY(2px);
+      background: #374151;
+    }
+
+    .k-key-action {
+      flex: 2;
+      max-width: 160px;
+      font-size: 14px;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+
+    .k-key-clear { background: #991b1b; }
+    .k-key-back { background: #374151; }
+    .k-key-space { flex: 4; max-width: 320px; }
+    .k-key-search { background: #4f46e5; }
+
+    /* MODAL */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      z-index: 60;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+    }
+
+    .modal-overlay.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .modal-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      width: 100%;
+      max-width: 640px;
+      max-height: 85vh;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      box-shadow: var(--shadow-lg);
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 14px;
+    }
+
+    .modal-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 24px;
+      cursor: pointer;
+    }
+
+    .disclaimer-banner {
+      background: rgba(79, 70, 229, 0.15);
+      border: 1px solid rgba(79, 70, 229, 0.3);
+      border-radius: var(--radius-md);
+      padding: 12px 16px;
+      font-size: 13px;
+      color: #a5b4fc;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .notes-section {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .note-item {
+      background: var(--bg-card);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .note-author {
+      font-size: 11px;
+      font-weight: 700;
+      color: #818cf8;
+    }
+
+    .note-input {
+      width: 100%;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      color: #fff;
+      font-size: 14px;
+      resize: vertical;
+      min-height: 80px;
+      outline: none;
+    }
+
+    /* TOAST */
+    .toast {
+      position: fixed;
+      top: 24px;
+      right: 24px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: #fff;
+      padding: 14px 20px;
+      border-radius: var(--radius-md);
+      font-size: 14px;
+      font-weight: 600;
+      z-index: 70;
+      box-shadow: var(--shadow-lg);
+      transform: translateY(-50px);
+      opacity: 0;
+      transition: all 0.25s;
+    }
+
+    .toast.show {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- HEADER -->
+  <header>
+    <div class="brand-section">
+      <a href="#" class="brand-logo">
+        <div class="brand-icon">⚡</div>
+        <div>
+          <div class="brand-title">GrabNGo</div>
+          <div style="font-size: 11px; color: var(--text-dim);">Service Desk & Admin Kiosk</div>
+        </div>
+      </a>
+      <select id="canteenSelect" class="canteen-selector" onchange="switchCanteen(this.value)">
+        <option value="BIG_MINGOS">Big Mingos Canteen</option>
+        <option value="LIBRARY_CANTEEN">Library Canteen</option>
+      </select>
+    </div>
+
+    <div class="header-actions">
+      <!-- In-Screen Virtual Keyboard Toggle -->
+      <button id="keyboardToggleBtn" class="keyboard-toggle-btn active" onclick="toggleVirtualKeyboardPreference()">
+        <span>⌨️ In-Screen Keyboard:</span>
+        <span id="keyboardToggleText">ON</span>
+      </button>
+
+      <div class="operator-profile">
+        <span>👤 <strong id="operatorName">Service Desk Operator</strong></span>
+        <span class="operator-role-tag">service_desk</span>
+      </div>
+
+      <button class="btn-logout" onclick="handleLogout()">Logout</button>
+    </div>
+  </header>
+
+  <!-- MAIN VIEWPORT -->
+  <main>
+    <!-- SEARCH BAR -->
+    <div class="search-panel">
+      <div class="search-input-wrapper">
+        <span class="search-icon-prefix">🔍</span>
+        <input
+          type="text"
+          id="orderSearchInput"
+          class="search-input"
+          placeholder="Touch here to search Order ID or Reference (e.g. MING-1001)..."
+          maxlength="64"
+          autocomplete="off"
+          autocorrect="off"
+          onfocus="onSearchInputFocus()"
+        />
+      </div>
+
+      <button class="btn-action" id="searchActionBtn" onclick="performSearch()">
+        <span>Search</span>
+      </button>
+
+      <button class="btn-secondary" onclick="clearSearch()">
+        <span>Clear</span>
+      </button>
+
+      <button class="btn-secondary" onclick="toggleKeyboardVisibility()">
+        <span>⌨️ Keyboard</span>
+      </button>
+
+      <button class="btn-secondary" onclick="loadOrderQueue()">
+        <span>🔄 Refresh</span>
+      </button>
+    </div>
+
+    <!-- FILTER BAR -->
+    <div class="filter-bar" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="filter-tab active" data-status="" onclick="setFilter('')">All Eligible (<span id="countAll">0</span>)</button>
+        <button class="filter-tab" data-status="placed" onclick="setFilter('placed')">Placed (<span id="countPlaced">0</span>)</button>
+        <button class="filter-tab" data-status="payment_verified" onclick="setFilter('payment_verified')">Payment Verified (<span id="countVerified">0</span>)</button>
+        <button class="filter-tab" data-status="accepted" onclick="setFilter('accepted')">Accepted (<span id="countAccepted">0</span>)</button>
+        <button class="filter-tab" data-status="preparing" onclick="setFilter('preparing')">Preparing (<span id="countPreparing">0</span>)</button>
+        <button class="filter-tab" data-status="ready_for_pickup" onclick="setFilter('ready_for_pickup')">Ready for Pickup (<span id="countReady">0</span>)</button>
+        <button class="filter-tab" data-status="completed" onclick="setFilter('completed')">Completed</button>
+        <button class="filter-tab" data-status="cancelled" onclick="setFilter('cancelled')">Cancelled</button>
+      </div>
+      <div id="liveIncomingBadge" style="display: flex; align-items: center; gap: 8px; background: rgba(79, 70, 229, 0.15); border: 1px solid var(--primary); padding: 6px 14px; border-radius: var(--radius-full); font-weight: 700; color: #818cf8;">
+        <span>⚡ Live Incoming Eligible:</span>
+        <span id="incomingEligibleCounter" style="font-size: 16px; color: #fff;">0</span>
+      </div>
+    </div>
+
+    <!-- ORDER QUEUE GRID -->
+    <div id="ordersGrid" class="orders-grid">
+      <!-- Order cards injected dynamically -->
+    </div>
+  </main>
+
+  <!-- IN-SCREEN VIRTUAL TOUCH KEYBOARD -->
+  <div id="touchKeyboard" class="touch-keyboard-container">
+    <div class="keyboard-top-bar">
+      <span>Touch-Screen Virtual Keyboard</span>
+      <div>
+        <span class="keyboard-char-counter" id="keyboardCharCounter">0/64</span>
+        <button class="btn-hide-keyboard" onclick="hideVirtualKeyboard()">✕ HIDE KEYBOARD</button>
+      </div>
+    </div>
+
+    <!-- Row 1: Numbers -->
+    <div class="keyboard-row">
+      <button class="k-key" onclick="pressVirtualKey('1')">1</button>
+      <button class="k-key" onclick="pressVirtualKey('2')">2</button>
+      <button class="k-key" onclick="pressVirtualKey('3')">3</button>
+      <button class="k-key" onclick="pressVirtualKey('4')">4</button>
+      <button class="k-key" onclick="pressVirtualKey('5')">5</button>
+      <button class="k-key" onclick="pressVirtualKey('6')">6</button>
+      <button class="k-key" onclick="pressVirtualKey('7')">7</button>
+      <button class="k-key" onclick="pressVirtualKey('8')">8</button>
+      <button class="k-key" onclick="pressVirtualKey('9')">9</button>
+      <button class="k-key" onclick="pressVirtualKey('0')">0</button>
+    </div>
+
+    <!-- Row 2: Letters -->
+    <div class="keyboard-row">
+      <button class="k-key" onclick="pressVirtualKey('Q')">Q</button>
+      <button class="k-key" onclick="pressVirtualKey('W')">W</button>
+      <button class="k-key" onclick="pressVirtualKey('E')">E</button>
+      <button class="k-key" onclick="pressVirtualKey('R')">R</button>
+      <button class="k-key" onclick="pressVirtualKey('T')">T</button>
+      <button class="k-key" onclick="pressVirtualKey('Y')">Y</button>
+      <button class="k-key" onclick="pressVirtualKey('U')">U</button>
+      <button class="k-key" onclick="pressVirtualKey('I')">I</button>
+      <button class="k-key" onclick="pressVirtualKey('O')">O</button>
+      <button class="k-key" onclick="pressVirtualKey('P')">P</button>
+    </div>
+
+    <!-- Row 3: Letters & Dash -->
+    <div class="keyboard-row">
+      <button class="k-key" onclick="pressVirtualKey('A')">A</button>
+      <button class="k-key" onclick="pressVirtualKey('S')">S</button>
+      <button class="k-key" onclick="pressVirtualKey('D')">D</button>
+      <button class="k-key" onclick="pressVirtualKey('F')">F</button>
+      <button class="k-key" onclick="pressVirtualKey('G')">G</button>
+      <button class="k-key" onclick="pressVirtualKey('H')">H</button>
+      <button class="k-key" onclick="pressVirtualKey('J')">J</button>
+      <button class="k-key" onclick="pressVirtualKey('K')">K</button>
+      <button class="k-key" onclick="pressVirtualKey('L')">L</button>
+      <button class="k-key" onclick="pressVirtualKey('-')">-</button>
+    </div>
+
+    <!-- Row 4: Letters & Underscore -->
+    <div class="keyboard-row">
+      <button class="k-key" onclick="pressVirtualKey('Z')">Z</button>
+      <button class="k-key" onclick="pressVirtualKey('X')">X</button>
+      <button class="k-key" onclick="pressVirtualKey('C')">C</button>
+      <button class="k-key" onclick="pressVirtualKey('V')">V</button>
+      <button class="k-key" onclick="pressVirtualKey('B')">B</button>
+      <button class="k-key" onclick="pressVirtualKey('N')">N</button>
+      <button class="k-key" onclick="pressVirtualKey('M')">M</button>
+      <button class="k-key" onclick="pressVirtualKey('_')">_</button>
+    </div>
+
+    <!-- Row 5: Actions -->
+    <div class="keyboard-row">
+      <button class="k-key k-key-action k-key-clear" onclick="pressVirtualClear()">CLEAR</button>
+      <button class="k-key k-key-action k-key-space" onclick="pressVirtualKey(' ')">SPACE</button>
+      <button class="k-key k-key-action k-key-back" onclick="pressVirtualBackspace()">⌫ BACK</button>
+      <button class="k-key k-key-action k-key-search" onclick="performSearch()">🔍 SEARCH</button>
+    </div>
+  </div>
+
+  <!-- ORDER DETAIL MODAL -->
+  <div id="orderDetailModal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="modalOrderRef" style="font-size: 20px;">Order Details</h2>
+          <div id="modalOrderId" style="font-size: 12px; color: var(--text-dim); font-family: monospace;"></div>
+        </div>
+        <button class="modal-close" onclick="closeOrderModal()">✕</button>
+      </div>
+
+      <div class="disclaimer-banner">
+        <span>🛡️</span>
+        <span id="modalPaymentDisclaimer">Demo payment verified — no real money was processed.</span>
+      </div>
+
+      <div>
+        <h4 style="font-size: 14px; margin-bottom: 8px; color: var(--text-muted);">Items Ordered</h4>
+        <div id="modalItemsList" class="order-items-list"></div>
+      </div>
+
+      <!-- Operational Notes -->
+      <div class="notes-section">
+        <h4 style="font-size: 14px; color: var(--text-muted);">Operational Notes</h4>
+        <div id="modalNotesList" style="display: flex; flex-direction: column; gap: 8px;"></div>
+
+        <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 6px;">
+          <textarea id="newNoteBody" class="note-input" placeholder="Add operational note (e.g. customer requested substitution)..." maxlength="1000"></textarea>
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span id="noteCharCounter" style="font-size: 12px; color: var(--text-dim);">0/1000</span>
+            <button class="btn-action" style="padding: 8px 16px; min-height: 40px;" onclick="submitOperationalNote()">Add Note</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Audit History -->
+      <div>
+        <h4 style="font-size: 14px; margin-bottom: 8px; color: var(--text-muted);">Immutable Audit History</h4>
+        <div id="modalAuditList" style="display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--text-muted);"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST NOTIFICATION -->
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const FUNCTIONS_HOST = 'http://127.0.0.1:5001/demo-grabngo-local/us-central1';
+    let idToken = null;
+    let currentCanteen = 'BIG_MINGOS';
+    let currentFilter = '';
+    let isKeyboardEnabled = true;
+    let allOrders = [];
+    let activeModalOrder = null;
+
+    // Initialize Virtual Keyboard Setting from localStorage
+    function initKeyboardSetting() {
+      const stored = localStorage.getItem('grabngo_virtual_keyboard_enabled');
+      if (stored !== null) {
+        isKeyboardEnabled = stored === 'true';
+      } else {
+        isKeyboardEnabled = true;
+      }
+      updateKeyboardToggleUI();
+    }
+
+    function updateKeyboardToggleUI() {
+      const btn = document.getElementById('keyboardToggleBtn');
+      const text = document.getElementById('keyboardToggleText');
+      if (isKeyboardEnabled) {
+        btn.classList.add('active');
+        text.innerText = 'ON';
+      } else {
+        btn.classList.remove('active');
+        text.innerText = 'OFF';
+        hideVirtualKeyboard();
+      }
+    }
+
+    function toggleVirtualKeyboardPreference() {
+      isKeyboardEnabled = !isKeyboardEnabled;
+      localStorage.setItem('grabngo_virtual_keyboard_enabled', isKeyboardEnabled ? 'true' : 'false');
+      updateKeyboardToggleUI();
+      showToast(isKeyboardEnabled ? 'In-Screen Keyboard Enabled' : 'In-Screen Keyboard Disabled');
+    }
+
+    function onSearchInputFocus() {
+      if (isKeyboardEnabled) {
+        showVirtualKeyboard();
+      }
+    }
+
+    function toggleKeyboardVisibility() {
+      const kb = document.getElementById('touchKeyboard');
+      if (kb.classList.contains('visible')) {
+        hideVirtualKeyboard();
+      } else {
+        showVirtualKeyboard();
+      }
+    }
+
+    function showVirtualKeyboard() {
+      document.getElementById('touchKeyboard').classList.add('visible');
+    }
+
+    function hideVirtualKeyboard() {
+      document.getElementById('touchKeyboard').classList.remove('visible');
+    }
+
+    function pressVirtualKey(char) {
+      const input = document.getElementById('orderSearchInput');
+      if (input.value.length < 64) {
+        input.value += char;
+        updateCharCounter();
+      }
+    }
+
+    function pressVirtualBackspace() {
+      const input = document.getElementById('orderSearchInput');
+      input.value = input.value.slice(0, -1);
+      updateCharCounter();
+    }
+
+    function pressVirtualClear() {
+      const input = document.getElementById('orderSearchInput');
+      input.value = '';
+      updateCharCounter();
+    }
+
+    function updateCharCounter() {
+      const len = document.getElementById('orderSearchInput').value.length;
+      document.getElementById('keyboardCharCounter').innerText = `${len}/64`;
+    }
+
+    // Call Cloud Function Helper
+    async function callFunction(name, data) {
+      const res = await fetch(`${FUNCTIONS_HOST}/${name}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ data })
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        throw new Error(json.error?.message || json.error || `HTTP ${res.status}`);
+      }
+      return json.result;
+    }
+
+    // Authentication Init
+    async function initAuth() {
+      try {
+        const res = await fetch('/api/token');
+        const data = await res.json();
+        if (data.ok && data.idToken) {
+          idToken = data.idToken;
+          document.getElementById('operatorName').innerText = data.operator.name;
+          loadOrderQueue();
+        } else {
+          showToast('Failed to authenticate operator token');
+        }
+      } catch (err) {
+        console.error(err);
+        showToast('Error connecting to local server');
+      }
+    }
+
+    // Load Incoming Orders Queue
+    async function loadOrderQueue() {
+      try {
+        const result = await callFunction('listOperationalOrders', {
+          canteenId: currentCanteen,
+          status: currentFilter || undefined,
+          limit: 50
+        });
+
+        allOrders = result.orders || [];
+        renderOrders();
+        updateCounts(result.incomingEligibleCount);
+      } catch (err) {
+        console.error('loadOrderQueue error:', err);
+        showToast(err.message);
+      }
+    }
+
+    function renderOrders() {
+      const grid = document.getElementById('ordersGrid');
+      grid.innerHTML = '';
+
+      if (allOrders.length === 0) {
+        grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-dim);">No operational orders found for this filter.</div>`;
+        return;
+      }
+
+      allOrders.forEach(order => {
+        const card = document.createElement('div');
+        card.className = 'order-card';
+
+        const itemsList = order.items || order.itemsSnapshot || [];
+        const itemsHtml = itemsList.map(item => `
+          <div class="order-item-row">
+            <span><strong>${item.quantity}x</strong> ${item.itemName}</span>
+          </div>
+        `).join('');
+
+        let actionBtns = '';
+        if (order.status === 'placed' || order.status === 'payment_verified') {
+          actionBtns = `
+            <button class="btn-status btn-accept" onclick="transitionStatus('${order.orderId}', 'accepted')">Accept Order</button>
+            <button class="btn-status" style="background:#ef4444; color:#fff;" onclick="promptCancellation('${order.orderId}', 'cancelled')">Cancel</button>
+          `;
+        } else if (order.status === 'accepted') {
+          actionBtns = `
+            <button class="btn-status btn-prepare" onclick="transitionStatus('${order.orderId}', 'preparing')">Start Preparing</button>
+            <button class="btn-status" style="background:#ef4444; color:#fff;" onclick="promptCancellation('${order.orderId}', 'cancelled')">Cancel</button>
+          `;
+        } else if (order.status === 'preparing') {
+          actionBtns = `
+            <button class="btn-status btn-ready" onclick="transitionStatus('${order.orderId}', 'ready_for_pickup')">Mark Ready</button>
+          `;
+        } else if (order.status === 'ready_for_pickup') {
+          actionBtns = `
+            <button class="btn-status btn-complete" onclick="transitionStatus('${order.orderId}', 'completed')">Complete Order</button>
+          `;
+        }
+
+        const slotText = order.pickupSlot ? `${order.pickupSlot.pickupDate || ''} (${order.pickupSlot.pickupStartTime || ''}-${order.pickupSlot.pickupEndTime || ''})` : '';
+
+        card.innerHTML = `
+          <div class="order-card-header">
+            <div>
+              <div class="order-ref">${order.shortOrderReference || order.orderId}</div>
+              <div class="order-id-sub">ID: ${order.orderId}</div>
+            </div>
+            <span class="status-badge status-${order.status}">${order.status.replace(/_/g, ' ')}</span>
+          </div>
+
+          <div class="order-items-list">${itemsHtml}</div>
+
+          <div class="order-meta-row">
+            <span>Slot: <strong>${slotText || 'Standard'}</strong></span>
+            <span>Canteen: <strong>${order.canteenId || currentCanteen}</strong></span>
+          </div>
+
+          <div class="order-actions">
+            ${actionBtns}
+            <button class="btn-details" onclick="openOrderModal('${order.orderId}')">Details & Notes</button>
+          </div>
+        `;
+
+        grid.appendChild(card);
+      });
+    }
+
+    function updateCounts(incomingCount) {
+      document.getElementById('countAll').innerText = allOrders.length;
+      document.getElementById('countPlaced').innerText = allOrders.filter(o => o.status === 'placed').length;
+      document.getElementById('countVerified').innerText = allOrders.filter(o => o.status === 'payment_verified').length;
+      document.getElementById('countAccepted').innerText = allOrders.filter(o => o.status === 'accepted').length;
+      document.getElementById('countPreparing').innerText = allOrders.filter(o => o.status === 'preparing').length;
+      document.getElementById('countReady').innerText = allOrders.filter(o => o.status === 'ready_for_pickup').length;
+      const liveIncoming = incomingCount !== undefined ? incomingCount : allOrders.filter(o => o.status === 'placed' || o.status === 'payment_verified').length;
+      const badgeElem = document.getElementById('incomingEligibleCounter');
+      if (badgeElem) badgeElem.innerText = liveIncoming;
+    }
+
+    async function setFilter(status) {
+      currentFilter = status;
+      document.querySelectorAll('.filter-tab').forEach(t => {
+        t.classList.toggle('active', t.getAttribute('data-status') === status);
+      });
+      loadOrderQueue();
+    }
+
+    async function switchCanteen(canteenId) {
+      currentCanteen = canteenId;
+      loadOrderQueue();
+      showToast(`Switched to ${canteenId}`);
+    }
+
+    // Status Transitions
+    async function transitionStatus(orderId, targetStatus, reason) {
+      try {
+        await callFunction('transitionOperationalOrderStatus', {
+          orderId,
+          targetStatus,
+          reason
+        });
+        showToast(`Order status updated to ${targetStatus}`);
+        loadOrderQueue();
+        if (activeModalOrder && activeModalOrder.orderId === orderId) {
+          openOrderModal(orderId);
+        }
+      } catch (err) {
+        showToast(err.message);
+      }
+    }
+
+    function promptCancellation(orderId, type) {
+      const reason = prompt(`Enter operational reason for ${type}:`, 'Cancelled at service desk counter');
+      if (reason !== null && reason.trim().length > 0) {
+        transitionStatus(orderId, type, reason.trim());
+      }
+    }
+
+    // Search
+    async function performSearch() {
+      const query = document.getElementById('orderSearchInput').value.trim();
+      if (!query) {
+        loadOrderQueue();
+        return;
+      }
+
+      const searchBtn = document.getElementById('searchActionBtn');
+      searchBtn.disabled = true;
+
+      try {
+        const res = await callFunction('searchOperationalOrders', { query });
+        if (res.found && res.order) {
+          allOrders = [res.order];
+          renderOrders();
+          hideVirtualKeyboard();
+          showToast(`Found order ${res.order.shortOrderReference || res.order.orderId}`);
+        } else {
+          allOrders = [];
+          renderOrders();
+          showToast('No matching order found');
+        }
+      } catch (err) {
+        showToast(err.message);
+      } finally {
+        searchBtn.disabled = false;
+      }
+    }
+
+    function clearSearch() {
+      document.getElementById('orderSearchInput').value = '';
+      updateCharCounter();
+      loadOrderQueue();
+    }
+
+    // Order Modal & Notes
+    async function openOrderModal(orderId) {
+      try {
+        const details = await callFunction('getOperationalOrderDetails', { orderId });
+        activeModalOrder = details.order;
+
+        document.getElementById('modalOrderRef').innerText = details.order.shortOrderReference || details.order.orderId;
+        document.getElementById('modalOrderId').innerText = `Order ID: ${details.order.orderId} | Canteen: ${details.order.canteenId}`;
+
+        // Operational view banner
+        document.getElementById('modalPaymentDisclaimer').innerText = 'Operational Fulfillment View — Order eligibility confirmed by backend';
+
+        // Items
+        const items = details.order.items || details.order.itemsSnapshot || [];
+        const itemsList = document.getElementById('modalItemsList');
+        itemsList.innerHTML = items.map(i => `
+          <div class="order-item-row">
+            <span><strong>${i.quantity}x</strong> ${i.itemName}</span>
+          </div>
+        `).join('');
+
+        // Notes
+        const notesList = document.getElementById('modalNotesList');
+        if (details.order.operationalNotes && details.order.operationalNotes.length > 0) {
+          notesList.innerHTML = details.order.operationalNotes.map(n => `
+            <div class="note-item">
+              <span class="note-author">${n.authorRole.toUpperCase()} (${n.authorUid.slice(0, 8)}...):</span>
+              <span>${n.body}</span>
+            </div>
+          `).join('');
+        } else {
+          notesList.innerHTML = '<div style="color: var(--text-dim); font-size: 13px;">No operational notes recorded yet.</div>';
+        }
+
+        // Audit events
+        const auditList = document.getElementById('modalAuditList');
+        if (details.order.auditHistory && details.order.auditHistory.length > 0) {
+          auditList.innerHTML = details.order.auditHistory.map(a => `
+            <div>• <strong>${a.eventType}</strong> by ${a.actorRole} ${a.reason ? `(${a.reason})` : ''}</div>
+          `).join('');
+        } else {
+          auditList.innerHTML = '<div>No audit events.</div>';
+        }
+
+        document.getElementById('orderDetailModal').classList.add('open');
+      } catch (err) {
+        showToast(err.message);
+      }
+    }
+
+    function closeOrderModal() {
+      document.getElementById('orderDetailModal').classList.remove('open');
+      activeModalOrder = null;
+    }
+
+    async function submitOperationalNote() {
+      if (!activeModalOrder) return;
+      const noteInput = document.getElementById('newNoteBody');
+      const body = noteInput.value.trim();
+
+      if (!body) {
+        showToast('Note cannot be empty');
+        return;
+      }
+
+      try {
+        await callFunction('createOperationalNote', {
+          orderId: activeModalOrder.orderId,
+          body
+        });
+        noteInput.value = '';
+        document.getElementById('noteCharCounter').innerText = '0/1000';
+        showToast('Operational note added successfully');
+        openOrderModal(activeModalOrder.orderId);
+      } catch (err) {
+        showToast(err.message);
+      }
+    }
+
+    // Logout
+    function handleLogout() {
+      idToken = null;
+      allOrders = [];
+      document.getElementById('ordersGrid').innerHTML = '';
+      closeOrderModal();
+      clearSearch();
+      showToast('Logged out successfully');
+      setTimeout(() => initAuth(), 1000);
+    }
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.innerText = msg;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 3000);
+    }
+
+    // Auto character counter for note textarea
+    document.getElementById('newNoteBody').addEventListener('input', (e) => {
+      document.getElementById('noteCharCounter').innerText = `${e.target.value.length}/1000`;
+    });
+
+    // Boot
+    initKeyboardSetting();
+    initAuth();
+  </script>
+</body>
+</html>

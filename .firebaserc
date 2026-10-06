@@ -1,0 +1,6 @@
+{
+  "projects": {
+    "default": "demo-grabngo-local",
+    "staging": "mad-lab-a9665"
+  }
+}

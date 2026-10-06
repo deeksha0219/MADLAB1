@@ -1,0 +1,292 @@
+rules_version = '2';
+// ============================================================================
+// GrabNGo - Cloud Firestore Security Rules (Step 7 Hardened)
+//
+// SAFETY WARNING:
+// DO NOT DEPLOY TO STAGING IN STEP 7.
+// This ruleset is active strictly for local Firebase Emulator Suite testing.
+// Deployment to staging requires completion of all Step 7 tests, migration safety review,
+// and explicit written user approval.
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // ------------------------------------------------------------------------
+    // Student User Profiles: users/{userId}
+    // ------------------------------------------------------------------------
+    match /users/{userId} {
+      // Students can read ONLY their own profile if authenticated
+      allow read: if isOwner(userId);
+
+      // Direct client creation of profiles is strictly FORBIDDEN.
+      // Profile creation must be performed exclusively via the trusted
+      // 'createStudentProfile' Cloud Function using the Firebase Admin SDK.
+      allow create: if false;
+
+      // Profile updates:
+      // - Must be the authenticated owner
+      // - STRICT ALLOWLIST: Only 'name', 'collegeId', and 'updatedAt' may be modified by client
+      // - Any attempt to modify role, status, uid, phone, or createdAt is strictly denied
+      // - Passwords must NEVER be written
+      allow update: if isOwner(userId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'collegeId', 'updatedAt'])
+        && !('password' in request.resource.data);
+
+      // Deletion is strictly prohibited from client devices
+      allow delete: if false;
+
+      // ----------------------------------------------------------------------
+      // User-Scoped Cart: users/{userId}/cart/{itemKey}
+      // ----------------------------------------------------------------------
+      match /cart/{itemKey} {
+        allow read: if isOwner(userId);
+
+        allow create: if isOwner(userId)
+          && request.resource.data.keys().hasOnly(['itemId', 'canteenId', 'quantity', 'updatedAt'])
+          && request.resource.data.itemId == itemKey
+          && request.resource.data.quantity is int
+          && request.resource.data.quantity >= 1
+          && request.resource.data.quantity <= 99
+          && request.resource.data.updatedAt == request.time;
+
+        allow update: if isOwner(userId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantity', 'updatedAt'])
+          && request.resource.data.quantity is int
+          && request.resource.data.quantity >= 1
+          && request.resource.data.quantity <= 99
+          && request.resource.data.updatedAt == request.time;
+
+        allow delete: if isOwner(userId);
+      }
+
+      // ----------------------------------------------------------------------
+      // Order Requests (Idempotency Tracking): users/{userId}/orderRequests/{idempotencyKey}
+      // ----------------------------------------------------------------------
+      match /orderRequests/{idempotencyKey} {
+        allow read: if isOwner(userId);
+        allow write: if false; // Cloud Functions only
+      }
+
+      // ----------------------------------------------------------------------
+      // Payment Requests (Idempotency Tracking): users/{userId}/paymentRequests/{idempotencyKey}
+      // ----------------------------------------------------------------------
+      match /paymentRequests/{idempotencyKey} {
+        allow read, write: if false; // Server-only via Cloud Functions
+      }
+
+      // ----------------------------------------------------------------------
+      // In-App Notifications (Step 10): users/{userId}/notifications/{notificationId}
+      // Mandatory Access Policy: Callable-Only Access.
+      // All notification reads and writes must go through trusted Cloud Functions.
+      // Direct client reads and writes are strictly denied.
+      // ----------------------------------------------------------------------
+      match /notifications/{notificationId} {
+        allow read, write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Server-Only Outbox: users/{userId}/notificationOutbox/{eventId}
+      // ----------------------------------------------------------------------
+      match /notificationOutbox/{eventId} {
+        allow read, write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Push Token Registry: users/{userId}/pushTokens/{tokenId}
+      // Server-only registry. Direct client reads and writes are strictly denied.
+      // ----------------------------------------------------------------------
+      match /pushTokens/{tokenId} {
+        allow read, write: if false;
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // Canteen Admin Documents: admins/{adminId}
+    // ------------------------------------------------------------------------
+    match /admins/{adminId} {
+      // Admins can read ONLY their own admin record if active
+      allow read: if isOwner(adminId) && resource.data.status == 'active';
+
+      // Client writes to admin records are completely forbidden (Server SDK only)
+      allow write: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Canteens & Catalog Subcollections (Step 6)
+    // canteens/{canteenId}
+    // canteens/{canteenId}/categories/{categoryId}
+    // canteens/{canteenId}/items/{itemId}
+    // canteens/{canteenId}/items/{itemId}/private/{docId}
+    // canteens/{canteenId}/pickupSlots/{slotId} (Step 7)
+    // ------------------------------------------------------------------------
+    function isStaffMember(canteenId) {
+      return isAuthenticated()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.status == 'active'
+        && (canteenId in get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.canteenIds);
+    }
+
+    function isCanteenAdmin(canteenId) {
+      return isStaffMember(canteenId)
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'canteen_admin';
+    }
+
+    match /canteens/{canteenId} {
+      // Authenticated students can read active canteens; assigned staff can read any status
+      allow read: if isAuthenticated() && (
+        resource.data.isActive == true || isStaffMember(canteenId)
+      );
+      // All writes must go through trusted Cloud Functions
+      allow write: if false;
+
+      match /categories/{categoryId} {
+        // Authenticated students can read active categories; assigned staff can read any status
+        allow read: if isAuthenticated() && (
+          resource.data.isActive == true || isStaffMember(canteenId)
+        );
+        allow write: if false;
+      }
+
+      match /items/{itemId} {
+        // Authenticated students can read active & available items; assigned staff can read any status
+        allow read: if isAuthenticated() && (
+          (resource.data.isActive == true && resource.data.isAvailable == true)
+          || isStaffMember(canteenId)
+        );
+        allow write: if false;
+
+        match /private/{docId} {
+          // Strictly restricted to active canteen admins assigned to this canteen (service_desk denied)
+          allow read: if isCanteenAdmin(canteenId);
+          allow write: if false;
+        }
+      }
+
+      // Step 7: Pickup Slots
+      match /pickupSlots/{slotId} {
+        // Authenticated users can read open slots; assigned staff can read any slot
+        allow read: if isAuthenticated() && (
+          resource.data.isOpen == true || isStaffMember(canteenId)
+        );
+        // Capacity reservation and slot configuration are Cloud Functions / Admin SDK only
+        allow write: if false;
+
+        // Phase 4B: Capacity Shards (Server-Only)
+        match /capacityShards/{shardId} {
+          allow read, write: if false;
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // Orders Collection (Step 7)
+    // orders/{orderId}
+    // ------------------------------------------------------------------------
+    match /orders/{orderId} {
+      // Students can read ONLY their own orders (safe client order history tracking)
+      // Direct raw order reads by staff/service desk are strictly DENIED to prevent bypassing operational masking
+      // Operational staff must access orders via sanitized Cloud Functions (listOperationalOrders, etc.)
+      allow read: if isAuthenticated() && resource.data.studentUid == request.auth.uid;
+
+      // All order creation, updates, and deletes are strictly prohibited from client devices
+      // Order creation & status transitions are brokered exclusively via Cloud Functions
+      allow write: if false;
+
+      // ----------------------------------------------------------------------
+      // Status History Subcollection (Step 8)
+      // orders/{orderId}/statusHistory/{eventId}
+      // ----------------------------------------------------------------------
+      match /statusHistory/{eventId} {
+        // Students can read history for their own orders
+        // Direct reads by staff/service desk are strictly DENIED to enforce callable masking
+        allow read: if isAuthenticated() &&
+          get(/databases/$(database)/documents/orders/$(orderId)).data.studentUid == request.auth.uid;
+
+        // Direct client writes are strictly denied (Cloud Functions only)
+        allow write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // ----------------------------------------------------------------------
+      // Payments Subcollection (Step 9)
+      // orders/{orderId}/payments/{paymentId}
+      // ----------------------------------------------------------------------
+      match /payments/{paymentId} {
+        // Direct client reads and writes are strictly denied (Cloud Functions only)
+        allow read, write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Payment History Subcollection (Step 9)
+      // orders/{orderId}/paymentHistory/{eventId}
+      // ----------------------------------------------------------------------
+      match /paymentHistory/{eventId} {
+        // Direct client reads and writes are strictly denied (Cloud Functions only)
+        allow read, write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Webhook Events Subcollection (Step 9 — Local-Only Emulator Verification)
+      // orders/{orderId}/webhookEvents/{eventId}
+      // ----------------------------------------------------------------------
+      match /webhookEvents/{eventId} {
+        allow read, write: if false; // Server-only
+      }
+
+      // ----------------------------------------------------------------------
+      // Operational Notes Subcollection (Step 11 — Server Callable Only)
+      // orders/{orderId}/operationalNotes/{noteId}
+      // ----------------------------------------------------------------------
+      match /operationalNotes/{noteId} {
+        allow read, write: if false;
+      }
+
+      // ----------------------------------------------------------------------
+      // Audit Events Subcollection (Step 11 — Server Callable Only, Append-Only)
+      // orders/{orderId}/auditEvents/{eventId}
+      // ----------------------------------------------------------------------
+      match /auditEvents/{eventId} {
+        allow read, write: if false;
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // Webhook Events Collection (Top-Level Step 9 Deduplication)
+    // ------------------------------------------------------------------------
+    match /webhookEvents/{document=**} {
+      allow read, write: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Notification Events Collection (Step 10 Server-Only Events)
+    // ------------------------------------------------------------------------
+    match /notificationEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Notification Outbox Collection (Phase 3 Server-Only Outbox)
+    // ------------------------------------------------------------------------
+    match /notificationOutbox/{outboxId} {
+      allow read, write: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Future Protected Collections (Payments, FCM)
+    // Remain denied until their respective steps are implemented.
+    // ------------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

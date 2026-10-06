@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -11,48 +11,107 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import MaterialIcon from "react-native-vector-icons/MaterialIcons";
 import { categoryStyles as styles } from "../styles/Studentstyles";
 import firestore from "@react-native-firebase/firestore";
+import auth from "@react-native-firebase/auth";
+import { formatPaiseToRupees } from "../services/catalogService";
+import { setUserCartItem, removeUserCartItem } from "../services/orderService";
+import { getActiveEnvironmentConfig } from "../config/environment";
 
 export default function CategoryScreen({ route, navigation }: any) {
-  const { category } = route.params;
+  const { category, canteenId = "BIG_MINGOS" } = route.params;
 
   const [availabilityMap, setAvailabilityMap] = useState<any>({});
   const [quantities, setQuantities] = useState<{ [key: string]: number }>({});
+  const [firestoreItems, setFirestoreItems] = useState<any[] | null>(null);
+  const [_loading, setLoading] = useState<boolean>(false);
+  const [_error, setError] = useState<string | null>(null);
+
+  // Fetch items dynamically from Firestore catalog subcollection
+  const fetchCategoryItems = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const snap = await firestore()
+        .collection("canteens")
+        .doc(canteenId)
+        .collection("items")
+        .where("categoryId", "==", category)
+        .where("isActive", "==", true)
+        .where("isAvailable", "==", true)
+        .get();
+
+      if (!snap.empty) {
+        const loaded = snap.docs.map(doc => {
+          const d = doc.data();
+          return {
+            id: doc.id,
+            name: d.name,
+            price: Math.floor((d.priceInPaise || 0) / 100),
+            priceInPaise: d.priceInPaise,
+            desc: d.description || "",
+            imageUrl: d.imageUrl,
+            image: null,
+          };
+        });
+        setFirestoreItems(loaded);
+      }
+    } catch {
+      setError("Could not refresh live items. Showing cached items.");
+    } finally {
+      setLoading(false);
+    }
+  }, [canteenId, category]);
+
+  useEffect(() => {
+    fetchCategoryItems();
+  }, [fetchCategoryItems]);
 
   // --------------------------------------------------
-  // CHECK FOOD AVAILABILITY
+  // CHECK FOOD AVAILABILITY FROM CANTEEN CATALOG
   // --------------------------------------------------
 
   useEffect(() => {
     const unsubscribe = firestore()
-      .collection("menu")
-      .where("category", "==", category)
+      .collection("canteens")
+      .doc(canteenId)
+      .collection("items")
+      .where("categoryId", "==", category)
       .onSnapshot((snapshot) => {
         const map: any = {};
 
         snapshot.docs.forEach((doc) => {
           const data = doc.data();
-          map[data.name] = data.available;
+          map[doc.id] = data.isAvailable !== false;
+          map[data.name] = data.isAvailable !== false;
         });
 
         setAvailabilityMap(map);
       });
 
     return () => unsubscribe();
-  }, [category]);
+  }, [canteenId, category]);
 
   // --------------------------------------------------
-  // SYNC CART QUANTITIES FROM FIRESTORE
+  // SYNC CART QUANTITIES FROM USER-SCOPED CART
   // --------------------------------------------------
 
   useEffect(() => {
+    const currentUid = auth().currentUser?.uid;
+    if (!currentUid) {
+      setQuantities({});
+      return;
+    }
+
     const unsubscribe = firestore()
+      .collection("users")
+      .doc(currentUid)
       .collection("cart")
       .onSnapshot((snap) => {
         const qtys: { [key: string]: number } = {};
 
         snap.docs.forEach((doc) => {
           const data = doc.data();
-          qtys[data.name] = data.quantity;
+          qtys[doc.id] = data.quantity;
+          if (data.name) qtys[data.name] = data.quantity;
         });
 
         setQuantities(qtys);
@@ -62,58 +121,48 @@ export default function CategoryScreen({ route, navigation }: any) {
   }, []);
 
   // --------------------------------------------------
-  // INCREASE QUANTITY
+  // INCREASE QUANTITY (USER CART)
   // --------------------------------------------------
 
-  const increaseQty = async (name: string, price: number) => {
+  const increaseQty = async (itemId: string, name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
-
-      const existing = await cartRef
-        .where("name", "==", name)
-        .get();
-
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-
-        await cartRef.doc(doc.id).update({
-          quantity: doc.data().quantity + 1,
-        });
-      } else {
-        await cartRef.add({
-          name,
-          price,
-          quantity: 1,
-        });
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) {
+        Alert.alert("Authentication Required", "Please sign in to add items to your cart.");
+        return;
       }
+
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current >= 99) return;
+
+      await setUserCartItem(currentUid, {
+        itemId,
+        canteenId,
+        quantity: current + 1,
+      });
     } catch (err: any) {
       Alert.alert("❌ Error", err.message);
     }
   };
 
   // --------------------------------------------------
-  // DECREASE QUANTITY
+  // DECREASE QUANTITY (USER CART)
   // --------------------------------------------------
 
-  const decreaseQty = async (name: string) => {
+  const decreaseQty = async (itemId: string, name: string) => {
     try {
-      const cartRef = firestore().collection("cart");
+      const currentUid = auth().currentUser?.uid;
+      if (!currentUid) return;
 
-      const existing = await cartRef
-        .where("name", "==", name)
-        .get();
-
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        const qty = doc.data().quantity;
-
-        if (qty <= 1) {
-          await cartRef.doc(doc.id).delete();
-        } else {
-          await cartRef.doc(doc.id).update({
-            quantity: qty - 1,
-          });
-        }
+      const current = quantities[itemId] || quantities[name] || 0;
+      if (current <= 1) {
+        await removeUserCartItem(currentUid, itemId);
+      } else {
+        await setUserCartItem(currentUid, {
+          itemId,
+          canteenId,
+          quantity: current - 1,
+        });
       }
     } catch (err: any) {
       Alert.alert("❌ Error", err.message);
@@ -336,7 +385,8 @@ export default function CategoryScreen({ route, navigation }: any) {
     ],
   };
 
-  const items = menu[category] || [];
+  const isStagingOrProd = getActiveEnvironmentConfig().environment !== 'local';
+  const items = firestoreItems && firestoreItems.length > 0 ? firestoreItems : (isStagingOrProd ? [] : (menu[category] || []));
 
   // --------------------------------------------------
   // TOTAL ITEMS IN CART
@@ -380,26 +430,35 @@ export default function CategoryScreen({ route, navigation }: any) {
           <Text style={styles.headerTitle}>
             {category}
           </Text>
-
-          <MaterialIcon
-            name="search"
-            size={26}
-            color="black"
-          />
         </View>
 
-        {/* ITEMS */}
+        {items.length === 0 && (
+          <View style={{ alignItems: "center", marginTop: 40 }}>
+            <Text style={{ color: "#888", fontSize: 16 }}>
+              No items currently available in this category.
+            </Text>
+          </View>
+        )}
+
+        {/* LIST */}
 
         {items.map((item: any, index: number) => {
+          const itemId = item.id || `demo_${item.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
           const isAvailable =
-            availabilityMap[item.name] !== false;
+            availabilityMap[itemId] !== undefined
+              ? availabilityMap[itemId]
+              : availabilityMap[item.name] !== undefined
+              ? availabilityMap[item.name]
+              : item.isAvailable !== undefined
+              ? item.isAvailable
+              : true;
 
           const qty =
-            quantities[item.name] || 0;
+            quantities[itemId] || quantities[item.name] || 0;
 
           return (
             <View
-              key={index}
+              key={item.id || index}
               style={[
                 styles.card,
                 !isAvailable && {
@@ -410,10 +469,17 @@ export default function CategoryScreen({ route, navigation }: any) {
 
               {/* FOOD IMAGE */}
 
-              <Image
-                source={item.image}
-                style={styles.image}
-              />
+              {item.imageUrl ? (
+                <Image
+                  source={{ uri: item.imageUrl }}
+                  style={styles.image}
+                />
+              ) : item.image ? (
+                <Image
+                  source={item.image}
+                  style={styles.image}
+                />
+              ) : null}
 
               {/* NAME + PRICE */}
 
@@ -423,7 +489,9 @@ export default function CategoryScreen({ route, navigation }: any) {
                 </Text>
 
                 <Text style={styles.price}>
-                  ₹{item.price}
+                  {typeof item.priceInPaise === "number"
+                    ? formatPaiseToRupees(item.priceInPaise)
+                    : `₹${item.price}`}
                 </Text>
               </View>
 
@@ -465,7 +533,7 @@ export default function CategoryScreen({ route, navigation }: any) {
 
                   <TouchableOpacity
                     onPress={() =>
-                      decreaseQty(item.name)
+                      decreaseQty(itemId, item.name)
                     }
                     style={{
                       paddingHorizontal: 18,
@@ -498,10 +566,7 @@ export default function CategoryScreen({ route, navigation }: any) {
 
                   <TouchableOpacity
                     onPress={() =>
-                      increaseQty(
-                        item.name,
-                        item.price
-                      )
+                      increaseQty(itemId, item.name)
                     }
                     style={{
                       paddingHorizontal: 18,
@@ -532,10 +597,7 @@ export default function CategoryScreen({ route, navigation }: any) {
                     },
                   ]}
                   onPress={() =>
-                    increaseQty(
-                      item.name,
-                      item.price
-                    )
+                    increaseQty(itemId, item.name)
                   }
                 >
                   <Text style={styles.buttonText}>

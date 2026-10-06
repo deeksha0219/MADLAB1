@@ -32,7 +32,6 @@ local.properties
 *.hprof
 .cxx/
 *.keystore
-!debug.keystore
 .kotlin/
 
 # node.js
@@ -73,3 +72,37 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Environment files and secrets (Never commit secrets)
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p8
+*.p12
+*.jks
+*serviceAccount*.json
+*-adminsdk-*.json
+android/local.properties
+android/debug.keystore
+
+# Build artifacts
+dist/
+
+# Firebase Emulator artifacts and logs
+.firebase/
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+pubsub-debug.log*
+database-debug.log*
+
+# System and IDE
+Thumbs.db
+.vscode/
+
+# Local development artifacts
+audit-root.json
+audit-functions.json

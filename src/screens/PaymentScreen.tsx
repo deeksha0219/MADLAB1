@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import {
   View,
   Text,
@@ -9,29 +9,40 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import firestore from "@react-native-firebase/firestore";
+import { createOrderCallable } from "../services/orderService";
+import { createDemoPaymentCallable } from "../services/paymentService";
+
+function generateUuid(): string {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
 
 export default function PaymentScreen({ navigation, route }: any) {
   const [selected, setSelected] = useState<string | null>(null);
   const [placing, setPlacing] = useState(false);
+  const idempotencyKeyRef = useRef<string>(generateUuid());
 
   const total = route.params?.total || 0;
   const pickupTime = route.params?.pickupTime || "Not selected";
 
+  // Generic Demo Labels (Step 9 Correction 1)
   const upiMethods = [
     {
-      id: "phonepe",
-      label: "PhonePe",
+      id: "upi_demo",
+      label: "UPI Demo",
       icon: require("../../assets/phonepe.png"),
     },
     {
-      id: "googlepay",
-      label: "Google Pay",
+      id: "wallet_demo",
+      label: "Demo Wallet Payment",
       icon: require("../../assets/gpay.png"),
     },
     {
-      id: "paytm",
-      label: "Paytm",
+      id: "online_demo",
+      label: "Demo Online Payment",
       icon: require("../../assets/paytm.png"),
     },
   ];
@@ -50,52 +61,7 @@ export default function PaymentScreen({ navigation, route }: any) {
   ];
 
   // --------------------------------------------------
-  // PAYMENT LABEL
-  // --------------------------------------------------
-
-  const getPaymentLabel = () => {
-    if (selected === "cash") {
-      return "Pay at Counter";
-    }
-
-    if (selected === "scan") {
-      return "QR Payment";
-    }
-
-    return "Paid Online";
-  };
-
-  // --------------------------------------------------
-  // ORDER ID
-  // Example: GNG-8F3K29
-  // --------------------------------------------------
-
-  const generateOrderId = () => {
-    const timePart = Date.now().toString(36).toUpperCase().slice(-5);
-
-    const randomPart = Math.random()
-      .toString(36)
-      .substring(2, 5)
-      .toUpperCase();
-
-    return `GNG-${timePart}${randomPart}`;
-  };
-
-  // --------------------------------------------------
-  // REFERENCE ID
-  // Example: REF-583921
-  // --------------------------------------------------
-
-  const generateReferenceId = () => {
-    const randomNumber = Math.floor(
-      100000 + Math.random() * 900000
-    );
-
-    return `REF-${randomNumber}`;
-  };
-
-  // --------------------------------------------------
-  // PLACE ORDER
+  // PLACE ORDER & INITIATE DEMO PAYMENT (STEP 9)
   // --------------------------------------------------
 
   const placeOrder = async () => {
@@ -114,162 +80,40 @@ export default function PaymentScreen({ navigation, route }: any) {
     setPlacing(true);
 
     try {
-      // ----------------------------------------------
-      // 1. GET CURRENT CART
-      // ----------------------------------------------
+      const items = route.params?.items || [];
+      const canteenId = route.params?.canteenId || "BIG_MINGOS";
+      const pickupSlotId = route.params?.pickupSlotId || "SLOT_DEFAULT";
+      const paymentMethod = selected === "cash" ? "cash" : "upi_demo";
 
-      const cartSnap = await firestore()
-        .collection("cart")
-        .get();
+      // Step 1: Create Order via trusted server Cloud Function
+      const orderResult = await createOrderCallable({
+        canteenId,
+        items,
+        pickupSlotId,
+        paymentMethod,
+        idempotencyKey: idempotencyKeyRef.current,
+      });
 
-      if (cartSnap.empty) {
-        Alert.alert(
-          "Cart is empty",
-          "Add items before placing an order."
-        );
+      let providerRef = orderResult.orderId;
 
-        setPlacing(false);
-        return;
+      // Step 2: For online demo payment, initiate server-owned demo payment record
+      if (paymentMethod === "upi_demo") {
+        const paymentResult = await createDemoPaymentCallable({
+          orderId: orderResult.orderId,
+          idempotencyKey: idempotencyKeyRef.current,
+        });
+        providerRef = paymentResult.providerReference || orderResult.orderId;
       }
 
-      // ----------------------------------------------
-      // 2. CONVERT CART INTO ARRAY
-      // ----------------------------------------------
-
-      const cartItems = cartSnap.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      })) as any[];
-
-      // ----------------------------------------------
-      // 3. GENERATE ORDER + REFERENCE IDS
-      // ----------------------------------------------
-
-      const orderId = generateOrderId();
-      const referenceId = generateReferenceId();
-
-      // ----------------------------------------------
-      // 4. PREPARE ITEMS FOR SERVICE DESK
-      // ----------------------------------------------
-
-      const serviceDeskItems = cartItems.map((item) => ({
-        id: item.id,
-        name: item.name,
-        price: Number(item.price) || 0,
-        quantity: Number(item.quantity) || 1,
-      }));
-
-      // ----------------------------------------------
-      // 5. CREATE ORDER DOCUMENT
-      // ----------------------------------------------
-      //
-      // This collection is the IMPORTANT one.
-      //
-      // Service Desk should listen to:
-      //
-      // firestore()
-      //   .collection("orders")
-      //   .onSnapshot(...)
-      //
-      // ----------------------------------------------
-
-      const orderData = {
-        orderId: orderId,
-        referenceId: referenceId,
-
-        customerName: "Student",
-
-        pickupTime: pickupTime,
-
-        items: serviceDeskItems,
-
-        total: Number(total) || 0,
-
-        payment: getPaymentLabel(),
-
-        // New order waiting for Service Desk
-        status: "new",
-
-        // Service Desk redemption
-        redeemed: false,
-        redeemedAt: null,
-
-        // Firebase server timestamp
-        placedAt: firestore.FieldValue.serverTimestamp(),
-
-        createdAt: firestore.FieldValue.serverTimestamp(),
-      };
-
-      // ----------------------------------------------
-      // 6. SAVE TO "orders"
-      // ----------------------------------------------
-      //
-      // SERVICE DESK / ADMIN DASHBOARD
-      //
-      // ----------------------------------------------
-
-      const orderRef = await firestore()
-        .collection("orders")
-        .add(orderData);
-
-      console.log("ORDER CREATED");
-      console.log("Firestore ID:", orderRef.id);
-      console.log("Order ID:", orderId);
-      console.log("Reference ID:", referenceId);
-
-      // ----------------------------------------------
-      // 7. SAVE TO STUDENT ORDER HISTORY
-      // ----------------------------------------------
-
-      await firestore()
-        .collection("orderHistory")
-        .add({
-          orderId: orderId,
-          referenceId: referenceId,
-
-          items: cartItems,
-
-          total: Number(total) || 0,
-
-          pickupTime: pickupTime,
-
-          placedAt: firestore.FieldValue.serverTimestamp(),
-
-          status: "new",
-
-          payment: getPaymentLabel(),
-        });
-
-      // ----------------------------------------------
-      // 8. CLEAR CART
-      // ----------------------------------------------
-
-      const batch = firestore().batch();
-
-      cartSnap.docs.forEach((doc) => {
-        batch.delete(doc.ref);
-      });
-
-      await batch.commit();
-
-      // ----------------------------------------------
-      // 9. GO TO ORDER CONFIRMED
-      // ----------------------------------------------
-
       navigation.navigate("OrderConfirmed", {
-        orderId: orderId,
-        referenceId: referenceId,
+        orderId: orderResult.orderId,
+        referenceId: providerRef,
       });
 
-    } catch (error) {
-      console.log("================================");
-      console.log("ORDER PLACEMENT ERROR");
-      console.log(error);
-      console.log("================================");
-
+    } catch (error: any) {
       Alert.alert(
         "Order Failed",
-        "Something went wrong while placing your order. Please try again."
+        error.message || "Something went wrong while placing your order. Please try again."
       );
     } finally {
       setPlacing(false);
@@ -325,6 +169,37 @@ export default function PaymentScreen({ navigation, route }: any) {
           paddingBottom: 30,
         }}
       >
+        {/* DEMO NOTICE BANNER (Step 9) */}
+        <View
+          style={{
+            backgroundColor: "#FEF3C7",
+            borderColor: "#F59E0B",
+            borderWidth: 1,
+            borderRadius: 12,
+            padding: 12,
+            marginBottom: 15,
+          }}
+        >
+          <Text
+            style={{
+              color: "#92400E",
+              fontWeight: "bold",
+              fontSize: 13,
+            }}
+          >
+            ⚠️ Demo Mode — No real charges will be made
+          </Text>
+          <Text
+            style={{
+              color: "#B45309",
+              fontSize: 12,
+              marginTop: 2,
+            }}
+          >
+            Payments are simulated locally in the Firebase Emulator Suite.
+          </Text>
+        </View>
+
         {/* PICKUP TIME */}
 
         <View
