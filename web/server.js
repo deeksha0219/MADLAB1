@@ -8,7 +8,12 @@ const BIND_HOST = '127.0.0.1'; // MUST bind strictly to loopback (never 0.0.0.0)
 const PROJECT_ID = 'demo-grabngo-local';
 const AUTH_PORT = 9099;
 
-const admin = require(path.resolve(__dirname, '../functions/node_modules/firebase-admin'));
+let admin;
+try {
+  admin = require(path.resolve(__dirname, '../functions/node_modules/firebase-admin'));
+} catch (_err) {
+  admin = require('firebase-admin');
+}
 
 if (!admin.apps.length) {
   process.env.FIREBASE_AUTH_EMULATOR_HOST = process.env.FIREBASE_AUTH_EMULATOR_HOST || `127.0.0.1:${AUTH_PORT}`;
