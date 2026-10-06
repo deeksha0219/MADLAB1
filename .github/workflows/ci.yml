@@ -86,7 +86,7 @@ jobs:
             }
 
             const envSrc = fs.readFileSync('src/config/environment.ts', 'utf8');
-            if (envSrc.includes('PRODUCTION_CONFIG') && envSrc.includes('useEmulator: true')) {
+            if (/const\s+PRODUCTION_CONFIG[\s\S]*?useEmulator:\s*true/.test(envSrc)) {
               console.error('Emulator must never be enabled in PRODUCTION_CONFIG');
               process.exit(1);
             }
