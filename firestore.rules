@@ -100,6 +100,14 @@ service cloud.firestore {
       match /notificationOutbox/{eventId} {
         allow read, write: if false;
       }
+
+      // ----------------------------------------------------------------------
+      // Push Token Registry: users/{userId}/pushTokens/{tokenId}
+      // Server-only registry. Direct client reads and writes are strictly denied.
+      // ----------------------------------------------------------------------
+      match /pushTokens/{tokenId} {
+        allow read, write: if false;
+      }
     }
 
     // ------------------------------------------------------------------------

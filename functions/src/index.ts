@@ -27,6 +27,12 @@ export {
   replayDeadLetterOutbox,
 } from './notifications/notificationWorker';
 import {
+  registerPushTokenInternal,
+  unregisterPushTokenInternal,
+  getPushPreferencesInternal,
+  setPushPreferencesInternal,
+} from './notifications/pushNotificationService';
+import {
   computeShardCapacities,
   planSlotReservationTx,
   executeSlotReservationTx,
@@ -5665,5 +5671,113 @@ export const repairUnreadNotificationCount = functions.https.onCall(
     }, { merge: true });
 
     return { success: true, targetUid, repairedCount: actualCount };
+  },
+);
+
+// ============================================================================
+// Firebase Cloud Messaging (FCM) Push Notification Callables (Phase 2 Additive)
+// ============================================================================
+
+/**
+ * Callable: registerPushToken
+ *
+ * Securely registers an FCM device token for the authenticated caller.
+ * - Derived UID: context.auth.uid only; client cannot specify UID.
+ * - Strict allowlist: ['token', 'platform', 'appVersion'].
+ * - Rejects malformed, oversized, or unknown fields.
+ * - Multi-device support with bounded active tokens (max 5 per user).
+ * - Idempotent registration.
+ */
+export const registerPushToken = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required to register push token.',
+      );
+    }
+    const uid = context.auth.uid;
+    rejectUnknownFields(data, ['token', 'platform', 'appVersion'], 'registerPushToken');
+
+    return await registerPushTokenInternal(uid, {
+      token: data.token,
+      platform: data.platform,
+      appVersion: data.appVersion,
+    });
+  },
+);
+
+/**
+ * Callable: unregisterPushToken
+ *
+ * Disables a push token on logout or rotation for the authenticated caller.
+ * - Derived UID: context.auth.uid only; cross-user deletion is impossible.
+ * - Strict allowlist: ['tokenId', 'token'].
+ * - Idempotent: safe to invoke repeatedly.
+ */
+export const unregisterPushToken = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required to unregister push token.',
+      );
+    }
+    const uid = context.auth.uid;
+    rejectUnknownFields(data, ['tokenId', 'token'], 'unregisterPushToken');
+
+    return await unregisterPushTokenInternal(uid, {
+      tokenId: data.tokenId,
+      token: data.token,
+    });
+  },
+);
+
+/**
+ * Callable: getPushNotificationPreferences
+ *
+ * Retrieves the push notification preferences for the authenticated caller.
+ */
+export const getPushNotificationPreferences = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required.',
+      );
+    }
+    rejectUnknownFields(data, [], 'getPushNotificationPreferences');
+    const preferences = await getPushPreferencesInternal(context.auth.uid);
+    return { success: true, preferences };
+  },
+);
+
+/**
+ * Callable: setPushNotificationPreferences
+ *
+ * Sets user presentation preferences for push notifications.
+ * Disabling push preferences NEVER affects canonical in-app notifications.
+ */
+export const setPushNotificationPreferences = functions.https.onCall(
+  async (data: Record<string, any>, context) => {
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Authentication required.',
+      );
+    }
+    rejectUnknownFields(
+      data,
+      ['orderUpdates', 'demoPaymentUpdates', 'promotionalUpdates'],
+      'setPushNotificationPreferences',
+    );
+
+    const preferences = await setPushPreferencesInternal(context.auth.uid, {
+      orderUpdates: data.orderUpdates,
+      demoPaymentUpdates: data.demoPaymentUpdates,
+      promotionalUpdates: data.promotionalUpdates,
+    });
+
+    return { success: true, preferences };
   },
 );

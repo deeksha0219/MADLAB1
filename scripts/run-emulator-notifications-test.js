@@ -1581,6 +1581,191 @@ async function testNotificationOutboxWorkflow() {
   assert(finalPaySnap.exists && finalPaySnap.data()?.status === 'succeeded_demo', '15.11.2 Payment status remains succeeded_demo');
 }
 
+// ── Suite 16: FCM Push Notification Additive Layer ────────────────────────
+async function testFcmPushNotificationLayer() {
+  console.log('\n=== Suite 16: FCM Push Notification Additive Layer ===');
+
+  // 16.1 Unauthenticated token registration is rejected (401)
+  const r1 = await callFunction('registerPushToken', {
+    token: 'fcm_test_token_alice_123456789012345678901234567890',
+    platform: 'android',
+  }, null);
+  assert(!r1.ok && r1.status === 401, '16.1 Unauthenticated registerPushToken is rejected (401)');
+
+  // 16.2 Malformed token rejected (too short)
+  const r2 = await callFunction('registerPushToken', {
+    token: 'short_token',
+    platform: 'android',
+  }, 'studentA');
+  assert(!r2.ok && (r2.status === 400 || r2.error?.status === 'INVALID_ARGUMENT'), '16.2 Malformed short token rejected');
+
+  // 16.3 Malformed token rejected (invalid characters)
+  const r3 = await callFunction('registerPushToken', {
+    token: 'token_with_spaces_and_illegal_chars!@#$%^&*()_1234567890',
+    platform: 'android',
+  }, 'studentA');
+  assert(!r3.ok && (r3.status === 400 || r3.error?.status === 'INVALID_ARGUMENT'), '16.3 Token with illegal characters rejected');
+
+  // 16.4 Unknown field rejected (client trying to pass recipientUid)
+  const r4 = await callFunction('registerPushToken', {
+    token: 'fcm_test_token_alice_123456789012345678901234567890',
+    platform: 'android',
+    recipientUid: USERS.studentB.uid,
+  }, 'studentA');
+  assert(!r4.ok && (r4.status === 400 || r4.error?.status === 'INVALID_ARGUMENT'), '16.4 Client-supplied recipientUid strictly rejected');
+
+  // 16.5 Invalid platform rejected
+  const r5 = await callFunction('registerPushToken', {
+    token: 'fcm_test_token_alice_123456789012345678901234567890',
+    platform: 'windows',
+  }, 'studentA');
+  assert(!r5.ok && (r5.status === 400 || r5.error?.status === 'INVALID_ARGUMENT'), '16.5 Invalid platform rejected');
+
+  // 16.6 Valid token registration succeeds for studentA
+  const validTokenA = 'fcm_alice_android_token_001_123456789012345678901234567890';
+  const r6 = await callFunction('registerPushToken', {
+    token: validTokenA,
+    platform: 'android',
+    appVersion: '1.0.0',
+  }, 'studentA');
+  assert(r6.ok === true && r6.data?.success === true, '16.6 Valid token registration succeeds');
+  assert(r6.data?.tokenId && r6.data.tokenId.startsWith('ptok_'), '16.7 Returns deterministic ptok_ tokenId');
+  assert(r6.data?.token === undefined, '16.8 Raw token is NOT returned in response');
+  const tokenAId = r6.data.tokenId;
+
+  // 16.9 Direct Firestore read of /users/{uid}/pushTokens/{tokenId} is DENIED
+  const directRead = await directFirestoreRest('GET', `users/${USERS.studentA.uid}/pushTokens`, tokenAId, null, 'studentA');
+  assert(!directRead.ok && directRead.status === 403, '16.9 Direct client read of /pushTokens/{tokenId} is DENIED by Firestore rules (403)');
+
+  // 16.10 Direct Firestore write to /users/{uid}/pushTokens/{tokenId} is DENIED
+  const directWrite = await directFirestoreRest('PATCH', `users/${USERS.studentA.uid}/pushTokens`, tokenAId, { enabled: false }, 'studentA');
+  assert(!directWrite.ok && directWrite.status === 403, '16.10 Direct client write to /pushTokens/{tokenId} is DENIED by Firestore rules (403)');
+
+  // 16.11 Duplicate token registration is idempotent
+  const r7 = await callFunction('registerPushToken', {
+    token: validTokenA,
+    platform: 'android',
+    appVersion: '1.0.0',
+  }, 'studentA');
+  assert(r7.ok === true && r7.data?.isIdempotent === true, '16.11 Duplicate token registration is idempotent');
+  assert(r7.data?.tokenId === tokenAId, '16.12 TokenId matches previous registration');
+
+  // 16.13 Token doc stored in Firestore has enabled=true and server timestamp
+  const tokenDocSnap = await db.collection('users').doc(USERS.studentA.uid).collection('pushTokens').doc(tokenAId).get();
+  assert(tokenDocSnap.exists && tokenDocSnap.data()?.enabled === true, '16.13 Server stores token doc with enabled=true');
+  assert(tokenDocSnap.data()?.environment === 'local', '16.14 Server derives environment=local');
+
+  // 16.15 Cross-user token registration isolation: studentB registers their own token
+  const validTokenB = 'fcm_bob_ios_token_001_123456789012345678901234567890';
+  const r8 = await callFunction('registerPushToken', {
+    token: validTokenB,
+    platform: 'ios',
+    appVersion: '1.0.0',
+  }, 'studentB');
+  assert(r8.ok === true && r8.data?.success === true, '16.15 studentB can register their own token');
+  const tokenBId = r8.data.tokenId;
+
+  // Verify studentA does not have tokenB and studentB does not have tokenA
+  const aHasB = await db.collection('users').doc(USERS.studentA.uid).collection('pushTokens').doc(tokenBId).get();
+  const bHasA = await db.collection('users').doc(USERS.studentB.uid).collection('pushTokens').doc(tokenAId).get();
+  assert(!aHasB.exists, '16.16 studentA does not contain studentB token document');
+  assert(!bHasA.exists, '16.17 studentB does not contain studentA token document');
+
+  // 16.18 Maximum tokens limit (5 active tokens): Register 5 more tokens for studentA
+  for (let i = 2; i <= 6; i++) {
+    await callFunction('registerPushToken', {
+      token: `fcm_alice_token_num_${i}_123456789012345678901234567890`,
+      platform: 'android',
+    }, 'studentA');
+  }
+  const allActiveA = await db.collection('users').doc(USERS.studentA.uid).collection('pushTokens').where('enabled', '==', true).get();
+  assert(allActiveA.size <= 5, '16.18 Active tokens bounded to max 5 per user');
+
+  // 16.19 Unregister token on logout disables token
+  const unregRes = await callFunction('unregisterPushToken', { tokenId: tokenAId }, 'studentA');
+  assert(unregRes.ok === true && unregRes.data?.success === true, '16.19 unregisterPushToken succeeds');
+  const tokenDocAfterUnreg = await db.collection('users').doc(USERS.studentA.uid).collection('pushTokens').doc(tokenAId).get();
+  assert(tokenDocAfterUnreg.data()?.enabled === false, '16.20 Token document is marked enabled=false on unregister');
+
+  // 16.21 Cross-user token unregister is impossible (studentA cannot unregister studentB token)
+  await callFunction('unregisterPushToken', { tokenId: tokenBId }, 'studentA');
+  const bobTokenStillEnabled = await db.collection('users').doc(USERS.studentB.uid).collection('pushTokens').doc(tokenBId).get();
+  assert(bobTokenStillEnabled.data()?.enabled === true, '16.21 studentA cannot unregister studentB token');
+
+  // 16.22 Push Preferences: get default preferences
+  const getPrefRes = await callFunction('getPushNotificationPreferences', {}, 'studentA');
+  assert(getPrefRes.ok === true && getPrefRes.data?.preferences?.orderUpdates === true, '16.22 Default push preferences returned');
+
+  // 16.23 Push Preferences: update preferences
+  const setPrefRes = await callFunction('setPushNotificationPreferences', {
+    orderUpdates: false,
+    demoPaymentUpdates: true,
+  }, 'studentA');
+  assert(setPrefRes.ok === true && setPrefRes.data?.preferences?.orderUpdates === false, '16.23 Push preferences updated');
+
+  // 16.24 In-app notifications continue to work even when push preferences orderUpdates=false
+  // Re-enable token for studentA to test outbox flow
+  const rReReg = await callFunction('registerPushToken', {
+    token: validTokenA,
+    platform: 'android',
+  }, 'studentA');
+  assert(rReReg.ok === true, '16.24 Re-register token succeeds');
+
+  // 16.25 Outbox delivery creates in-app notification and attempts push
+  const testOutboxId = `outbox_push_test_${Date.now()}_student`;
+  await db.collection('notificationOutbox').doc(testOutboxId).set({
+    outboxId: testOutboxId,
+    sourceEventId: `event_push_test_${Date.now()}`,
+    sourceEventType: 'order',
+    recipientRole: 'student',
+    recipientUid: USERS.studentA.uid,
+    notificationType: 'order_accepted',
+    orderId: 'GNG-PUSH01',
+    status: 'pending',
+    attemptCount: 0,
+    maxAttempts: 5,
+    leaseUntil: null,
+    nextRetryAt: null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  const outboxDeliveryResult = await deliverOutboxEvent(testOutboxId);
+  assert(outboxDeliveryResult.success === true && outboxDeliveryResult.status === 'delivered', '16.25 Outbox delivery succeeds with push layer integrated');
+
+  const outboxDoc = await db.collection('notificationOutbox').doc(testOutboxId).get();
+  assert(outboxDoc.data()?.status === 'delivered', '16.26 Outbox doc status is delivered');
+  assert(outboxDoc.data()?.pushDeliveryStatus !== undefined, '16.27 Outbox doc records pushDeliveryStatus');
+
+  // 16.28 Push failure isolation: Even if push delivery fails or provider throws, in-app notification is NOT removed or altered
+  const failOutboxId = `outbox_push_fail_sim_${Date.now()}_student`;
+  global.__MOCK_FCM_RESPONSE__ = 'transient_error';
+  await db.collection('notificationOutbox').doc(failOutboxId).set({
+    outboxId: failOutboxId,
+    sourceEventId: `event_push_fail_${Date.now()}`,
+    sourceEventType: 'order',
+    recipientRole: 'student',
+    recipientUid: USERS.studentA.uid,
+    notificationType: 'order_preparing',
+    orderId: 'GNG-PUSH02',
+    status: 'pending',
+    attemptCount: 0,
+    maxAttempts: 5,
+    leaseUntil: null,
+    nextRetryAt: null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  const failOutboxRes = await deliverOutboxEvent(failOutboxId);
+  delete global.__MOCK_FCM_RESPONSE__;
+  assert(failOutboxRes.success === true && failOutboxRes.status === 'delivered', '16.28 Push failure does not fail in-app outbox delivery');
+
+  // 16.29 In-app notification exists and is unread
+  const studentANotifs = await getNotificationsAdmin(USERS.studentA.uid);
+  const foundFailNotif = studentANotifs.find((n) => n.orderId === 'GNG-PUSH02');
+  assert(foundFailNotif !== undefined && foundFailNotif.type === 'order_preparing', '16.29 In-app notification preserved 100% despite push failure');
+}
+
 // --------------------------------------------------------------------------
 // MAIN
 // --------------------------------------------------------------------------
@@ -1611,6 +1796,7 @@ async function main() {
     await testTemplateSanitization();
     await testMandatoryEdgeCases();
     await testNotificationOutboxWorkflow();
+    await testFcmPushNotificationLayer();
 
   } catch (err) {
     console.error('\nFATAL: Test runner error:', err?.message || err);

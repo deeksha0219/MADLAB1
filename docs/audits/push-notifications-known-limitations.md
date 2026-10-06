@@ -24,7 +24,7 @@
 ## 3. Token Churn & Invalidation
 
 1. **FCM Token Expiration:** Tokens change when the app is uninstalled and reinstalled, when app data is cleared, or when Google rotates tokens periodically. The app must register token refresh listeners (`messaging().onTokenRefresh()`).
-2. **Unregistered Tokens (HTTP 410 / `messaging/registration-token-not-registered`):** The server-side outbox worker must gracefully catch unregistration errors and delete the stale token document from `/users/{uid}/fcmTokens` to avoid sending to dead devices on subsequent events.
+2. **Unregistered Tokens (HTTP 410 / `messaging/registration-token-not-registered`):** The server-side outbox worker must gracefully catch unregistration errors and disable/prune the stale token document from `/users/{uid}/pushTokens` to avoid sending to dead devices on subsequent events.
 
 ---
 

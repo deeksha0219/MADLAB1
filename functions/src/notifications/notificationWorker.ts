@@ -22,6 +22,7 @@ import {
   getFirestoreFieldValue,
   getFirestoreTimestamp,
 } from './notificationOutbox';
+import { deliverPushNotificationForRecipient } from './pushNotificationService';
 
 export const MAX_OUTBOX_ATTEMPTS = 5;
 
@@ -194,6 +195,26 @@ export async function deliverOutboxEvent(
       throw new Error('UNKNOWN_RECIPIENT_ROLE');
     }
 
+    // Phase 2.5: Additive FCM Push Delivery (Non-blocking, Best-Effort Delivery)
+    let pushResult: { status: string; attempted: number; succeeded: number; failed: number } = {
+      status: 'skipped',
+      attempted: 0,
+      succeeded: 0,
+      failed: 0,
+    };
+    try {
+      if (entry.recipientRole === 'student' && entry.recipientUid) {
+        pushResult = await deliverPushNotificationForRecipient(entry.recipientUid, {
+          notificationId: entry.sourceEventId,
+          type: entry.notificationType,
+          orderId: entry.orderId,
+        });
+      }
+    } catch (pushErr: any) {
+      // Invariant: FCM push failure NEVER fails in-app notification delivery
+      functions.logger.warn(`[OutboxWorker] Non-blocking push delivery error for ${outboxId}:`, pushErr?.message);
+    }
+
     // Phase 3: Mark delivered and clear lease/retry fields
     const now = getFirestoreFieldValue().serverTimestamp();
     await outboxRef.update({
@@ -202,6 +223,9 @@ export async function deliverOutboxEvent(
       nextRetryAt: null,
       processedAt: now,
       updatedAt: now,
+      pushDeliveryStatus: pushResult.status,
+      pushTokensAttempted: pushResult.attempted,
+      pushTokensSucceeded: pushResult.succeeded,
     });
 
     logOutboxTelemetry({
