@@ -103,7 +103,6 @@ database-debug.log*
 Thumbs.db
 .vscode/
 
-# Local development service desk kiosk harness
-web/
+# Local development artifacts
 audit-root.json
 audit-functions.json

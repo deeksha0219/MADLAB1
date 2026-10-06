@@ -165,6 +165,7 @@ docs/audits/android-release-build.md
 docs/audits/ci-summary.md
 docs/audits/final-remediation-validation.md
 docs/audits/final-repository-review.md
+docs/audits/github-source-upload-manifest.txt
 docs/audits/ios-release-build.md
 docs/audits/physical-device-smoke-test.md
 docs/audits/push-notifications-baseline.md
@@ -351,3 +352,5 @@ src/services/pushNotificationService.ts
 src/styles/Studentstyles.ts
 src/types/react-native-vector-icons.d.ts
 tsconfig.json
+web/index.html
+web/server.js
