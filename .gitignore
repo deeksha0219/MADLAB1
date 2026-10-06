@@ -79,8 +79,17 @@ yarn-error.log
 !.env.example
 !.env.*.example
 *.pem
+*.key
+*.p8
+*.p12
+*.jks
 *serviceAccount*.json
 *-adminsdk-*.json
+android/local.properties
+android/debug.keystore
+
+# Build artifacts
+dist/
 
 # Firebase Emulator artifacts and logs
 .firebase/
@@ -89,6 +98,10 @@ firestore-debug.log*
 ui-debug.log*
 pubsub-debug.log*
 database-debug.log*
+
+# System and IDE
+Thumbs.db
+.vscode/
 
 # Local development service desk kiosk harness
 web/
